@@ -149,7 +149,13 @@ def build_ui(index: FabricIndex):
 
         with gr.Row(equal_height=True):
             with gr.Column(scale=2):
-                input_img = gr.Image(type="pil", label="拖拽或点击上传照片", height=320)
+                input_img = gr.ImageEditor(
+                    type="pil",
+                    label="上传照片后，框选面料区域再检索",
+                    height=360,
+                    crop_size=None,
+                    transforms=["crop"],
+                )
             with gr.Column(scale=3):
                 with gr.Row():
                     top_k = gr.Slider(3, 50, value=15, step=1, label="返回数量",
@@ -193,7 +199,11 @@ def build_ui(index: FabricIndex):
                     f'<div style="width:{pct}%;height:100%;background:{color};border-radius:2px"></div>'
                     f'</div></div>')
 
-        def on_search(img, k):
+        def on_search(img_editor, k):
+            # ImageEditor returns dict {"composite": PIL, "layers": [...]}
+            if img_editor is None:
+                return [], "", progress_html("请先上传照片", "#999")
+            img = img_editor["composite"] if isinstance(img_editor, dict) else img_editor
             if img is None:
                 return [], "", progress_html("请先上传照片", "#999")
 
