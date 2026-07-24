@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+.venv/
+
+# Cache
+.fabric_cache/
+matcher_v3/cache/
+*.pkl
+*.npy
+*.npz
+
+# Model weights
+*.safetensors
+*.pt
+*.pth
+*.bin
+checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Gradio
+flagged/
+
+# Fabric images (large files, keep separately)
+dir/fabric/
+dir/photo/
