@@ -163,7 +163,7 @@ def build_ui(index):
                 results = index.search(img, int(k))
             except Exception as e:
                 traceback.print_exc()
-                return [], "", html(f"Error: {e}", "#d32f2f")
+                return [], "", status_html(f"Error: {e}", "#d32f2f")
 
             elapsed = time.time() - t0
             top_n = html.escape(results[0][0]) if results else "-"
@@ -181,7 +181,7 @@ def build_ui(index):
                 lines.append(f'<div style="padding:2px 0">'
                              f'<b>#{i+1}</b> {html.escape(name)} {conf_bar(sim)}</div>')
 
-            yield items, "\n".join(lines), html(
+            yield items, "\n".join(lines), status_html(
                 f"Done - {elapsed*1000:.0f}ms - Top-1: {top_n} ({top_s:.3f})", sc)
 
         def status_html(msg, color):
