@@ -112,7 +112,7 @@ def build_ui(index):
             with gr.Column(scale=1):
                 input_img = gr.ImageEditor(
                     type="pil", label="Upload photo, then crop fabric area",
-                    crop_size=(1,1), transforms=["crop"], brush=False,
+                    canvas_size=(800, 800), transforms=["crop"], brush=False,
                 )
             with gr.Column(scale=1):
                 gr.Markdown(f"**Library**: {len(index.names)} fabrics | **Model**: CLIP ViT-B/32\n\n"
@@ -152,12 +152,12 @@ def build_ui(index):
                     f'<span style="display:inline-block;width:{pct}px;height:4px;background:{c};border-radius:2px"></span>')
 
         def on_search(img, k):
-            if img is None: return [], "", html("Upload a photo first", "#999")
+            if img is None: return [], "", status_html("Upload a photo first", "#999")
             if isinstance(img, dict):
                 img = img.get("composite") or img.get("background") or img
-            if img is None: return [], "", html("Upload a photo first", "#999")
+            if img is None: return [], "", status_html("Upload a photo first", "#999")
 
-            yield [], "", html("Extracting features...", "#999")
+            yield [], "", status_html("Extracting features...", "#999")
             t0 = time.time()
             try:
                 results = index.search(img, int(k))
@@ -184,11 +184,11 @@ def build_ui(index):
             yield items, "\n".join(lines), html(
                 f"Done - {elapsed*1000:.0f}ms - Top-1: {top_n} ({top_s:.3f})", sc)
 
-        def html(msg, color):
+        def status_html(msg, color):
             return f'<div style="color:{color};padding:10px 0;font-size:13px">{msg}</div>'
 
         def on_clear():
-            return None, "", html("Ready", "#999")
+            return None, "", status_html("Ready", "#999")
 
         btn.click(on_search, inputs=[input_img, top_k], outputs=[gallery, detail, progress])
         clear_btn.click(on_clear, outputs=[input_img, detail, progress])
