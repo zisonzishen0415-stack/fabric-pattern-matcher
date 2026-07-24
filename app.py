@@ -129,8 +129,7 @@ def build_ui(index):
         gr.Markdown("---")
         gallery = gr.Gallery(label="Results", columns=5, rows="auto", height=640,
                              object_fit="contain", show_label=False)
-        detail = gr.Textbox(label="", lines=8, max_lines=15, show_label=False,
-                            placeholder="Results will appear here...")
+        detail = gr.HTML()
 
         def conf_label(s):
             if s > 0.85: return "Very High"
