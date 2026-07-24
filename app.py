@@ -139,27 +139,35 @@ def build_ui(index: FabricIndex):
     with gr.Blocks(title="Fabric Pattern Matcher") as app:
         gr.Markdown("## 面料花型匹配")
 
-        with gr.Row(equal_height=True):
-            with gr.Column(scale=2):
+        with gr.Row():
+            with gr.Column(scale=1):
                 input_img = gr.ImageEditor(
                     type="pil",
-                    label="上传照片后，框选面料区域再检索",
-                    height=360,
+                    label="拖拽或粘贴照片，点击裁剪工具框选面料区域",
+                    canvas_size=(600, 600),
+                    fixed_canvas=False,
                     transforms=["crop"],
                     layers=False,
                     brush=False,
                 )
-            with gr.Column(scale=3):
-                with gr.Row():
-                    top_k = gr.Slider(3, 50, value=15, step=1, label="返回数量",
-                                      info="控制显示多少条匹配结果")
+            with gr.Column(scale=1):
+                gr.Markdown(
+                    f"**花型库**：{len(index.names)} 张\n"
+                    f"**模型**：CLIP ViT-B/32\n\n"
+                    "**使用方法**：\n"
+                    "1. 左侧上传照片\n"
+                    "2. 点击 ✂️ 裁剪工具\n"
+                    "3. 拖拽框选面料区域\n"
+                    "4. 点「开始检索」"
+                )
+                top_k = gr.Slider(3, 50, value=15, step=1, label="返回数量")
                 with gr.Row():
                     btn = gr.Button("开始检索", variant="primary", size="lg")
                     clear_btn = gr.Button("清空", size="lg")
 
                 progress = gr.HTML(
-                    '<div style="color:#999;padding:20px 0">'
-                    f'花型库已就绪 · {len(index.names)} 张 · CLIP ViT-B/32'
+                    '<div style="color:#999;padding:10px 0;font-size:13px">'
+                    '就绪'
                     '</div>'
                 )
 
@@ -251,7 +259,7 @@ def build_ui(index: FabricIndex):
             )
 
         def progress_html(msg, color):
-            return f'<div style="color:{color};padding:20px 0;font-size:14px">{msg}</div>'
+            return f'<div style="color:{color};padding:10px 0;font-size:13px">{msg}</div>'
 
         def on_clear():
             return None, "", progress_html(
