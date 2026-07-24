@@ -112,7 +112,7 @@ def build_ui(index):
             with gr.Column(scale=1):
                 input_img = gr.ImageEditor(
                     type="pil", label="Upload photo, then crop fabric area",
-                    canvas_size=(800, 800), transforms=["crop"], brush=False,
+                    canvas_size=(800, 800), transforms=["crop"], brush=False, layers=False,
                 )
             with gr.Column(scale=1):
                 gr.Markdown(f"**Library**: {len(index.names)} fabrics | **Model**: CLIP ViT-B/32\n\n"
