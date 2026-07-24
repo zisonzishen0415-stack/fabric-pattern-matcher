@@ -141,24 +141,17 @@ def build_ui(index: FabricIndex):
 
         with gr.Row():
             with gr.Column(scale=1):
-                input_img = gr.ImageEditor(
+                input_img = gr.Image(
                     type="pil",
-                    label="拖拽或粘贴照片，点击裁剪工具框选面料区域",
-                    canvas_size=(600, 600),
-                    fixed_canvas=False,
-                    transforms=["crop"],
-                    layers=False,
-                    brush=False,
+                    label="上传面料照片",
+                    height=480,
                 )
             with gr.Column(scale=1):
                 gr.Markdown(
                     f"**花型库**：{len(index.names)} 张\n"
                     f"**模型**：CLIP ViT-B/32\n\n"
-                    "**使用方法**：\n"
-                    "1. 左侧上传照片\n"
-                    "2. 点击 ✂️ 裁剪工具\n"
-                    "3. 拖拽框选面料区域\n"
-                    "4. 点「开始检索」"
+                    "💡 **提示**：如照片包含非面料区域\n"
+                    "（桌面/墙壁/人物），建议先裁剪"
                 )
                 top_k = gr.Slider(3, 50, value=15, step=1, label="返回数量")
                 with gr.Row():
@@ -172,9 +165,9 @@ def build_ui(index: FabricIndex):
                 )
 
         gr.Markdown("---")
-        gallery = gr.Gallery(label="匹配结果", columns=5, rows=3, height=520, object_fit="contain",
+        gallery = gr.Gallery(label="匹配结果", columns=5, rows="auto", height=640, object_fit="contain",
                              show_label=False)
-        detail = gr.Textbox(label="", lines=10, max_lines=20, visible=True, show_label=False,
+        detail = gr.Textbox(label="", lines=8, max_lines=15, visible=True, show_label=False,
                             placeholder="检索结果将显示在这里...")
 
         def _confidence_label(sim):
@@ -200,12 +193,9 @@ def build_ui(index: FabricIndex):
                     f'<div style="width:{pct}%;height:100%;background:{color};border-radius:2px"></div>'
                     f'</div></div>')
 
-        def on_search(img_editor, k):
-            # ImageEditor returns dict {"composite": PIL, "layers": [...]}
-            if img_editor is None:
-                return [], "", progress_html("请先上传照片", "#999")
-            img = img_editor["composite"] if isinstance(img_editor, dict) else img_editor
+        def on_search(img, k):
             if img is None:
+                return [], "", progress_html("请先上传照片", "#999")
                 return [], "", progress_html("请先上传照片", "#999")
 
             yield [], "", progress_html("正在提取特征...", "#999")
