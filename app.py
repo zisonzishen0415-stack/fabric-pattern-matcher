@@ -53,7 +53,8 @@ class FabricIndex:
         cache_hash = os.path.join(self.cache_dir, "hash.txt")
         os.makedirs(self.cache_dir, exist_ok=True)
 
-        files = sorted(os.listdir(fabric_dir))
+        files = sorted([f for f in os.listdir(fabric_dir)
+                       if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
         h = hashlib.md5("".join(files).encode()).hexdigest()[:8]
 
         if not force and os.path.exists(cache_emb) and os.path.exists(cache_hash):
@@ -89,6 +90,8 @@ class FabricIndex:
         return self
 
     def _build_faiss(self):
+        if len(self.embeddings) == 0:
+            raise RuntimeError(f"No valid images found in {self._fabric_dir}")
         self.index = faiss.IndexFlatIP(self.embeddings.shape[1])
         self.index.add(self.embeddings)
 
