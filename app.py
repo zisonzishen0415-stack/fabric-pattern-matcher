@@ -107,46 +107,36 @@ class FabricIndex:
 # ============================================================
 def build_ui(index):
     n_fabrics = len(index.names)
-    with gr.Blocks(theme=gr.themes.Monochrome(), title="Fabric Pattern Matcher") as app:
-        gr.Markdown("## Fabric Pattern Matcher")
-
-        with gr.Row(equal_height=False):
-            # LEFT: upload + gallery
+    css = """
+    footer { display: none !important; }
+    """
+    with gr.Blocks(css=css, theme=gr.themes.Monochrome(), title="Fabric Pattern Matcher") as app:
+        # Top row: upload + controls
+        with gr.Row():
             with gr.Column(scale=3):
                 input_img = gr.ImageEditor(
                     type="pil",
-                    label="1. Upload photo, then click scissors icon to crop fabric area",
+                    label="Upload photo, click ✂ to crop fabric area",
                     canvas_size=(800, 800),
                     transforms=["crop"],
                     brush=False,
                     layers=False,
                 )
-
-                gallery = gr.Gallery(
-                    label="Matching Results",
-                    columns=5,
-                    rows="auto",
-                    height="100%",
-                    object_fit="contain",
-                    show_label=True,
-                    allow_preview=True,
-                    preview=True,
-                )
-
-            # RIGHT: controls + ranked list
-            with gr.Column(scale=2):
-                gr.Markdown(f"**Library**: {n_fabrics} fabrics  \n**Model**: CLIP ViT-B/32\n\n"
-                            "2. Drag handles to select fabric region  \n"
-                            "3. Choose result count  \n"
-                            "4. Click Search")
-                top_k = gr.Slider(3, 50, value=15, step=1, label="Results count")
+            with gr.Column(scale=1):
+                gr.Markdown(f"**{n_fabrics}** fabrics  \n**CLIP ViT-B/32**")
+                top_k = gr.Slider(3, 50, value=15, step=1, label="Results")
                 with gr.Row():
                     btn = gr.Button("Search", variant="primary", size="lg")
-                    clear_btn = gr.Button("Clear", size="lg")
+                    clear_btn = gr.Button("Clear", size="sm")
 
-                result_html = gr.HTML(
-                    f'<div style="color:#999;font-size:13px;padding:20px 0">Ready</div>'
-                )
+        # Results: full-width gallery
+        gallery = gr.Gallery(
+            label="Results",
+            columns=5,
+            rows=1,
+            height=300,
+            object_fit="contain",
+        )
 
         def conf_label(s):
             if s > 0.85: return "Very High"
@@ -155,75 +145,35 @@ def build_ui(index):
             if s > 0.50: return "Low"
             return "Very Low"
 
-        def conf_color(s):
-            if s > 0.85: return "#2e7d32"
-            if s > 0.75: return "#4caf50"
-            if s > 0.65: return "#ff9800"
-            if s > 0.50: return "#f57c00"
-            return "#d32f2f"
-
-        def conf_bar(s):
-            pct = min(int(s*100), 100); c = conf_color(s)
-            return (f'<span style="display:inline-block;width:120px;height:4px;background:#e0e0e0;'
-                    f'border-radius:2px;vertical-align:middle;margin:0 6px">'
-                    f'<span style="display:block;width:{pct}%;height:100%;background:{c};border-radius:2px">'
-                    f'</span></span>'
-                    f'<span style="color:{c};font-weight:600;font-size:12px">{pct}%</span>')
-
         def on_search(img, k):
             if img is None:
-                return [], on_clear_html()
+                return None
             if isinstance(img, dict):
                 img = img.get("composite") or img.get("background") or img
             if img is None:
-                return [], on_clear_html()
+                return None
 
             t0 = time.time()
             try:
                 results = index.search(img, int(k))
-            except Exception as e:
-                return [], f'<div style="color:#d32f2f">Error: {html.escape(str(e))}</div>'
+            except Exception:
+                return None
 
             elapsed = time.time() - t0
-            top_n = html.escape(results[0][0]) if results else "-"
-            top_s = results[0][1] if results else 0
-            sc = conf_color(top_s)
+            items = [(pil, f"#{i+1} ({sim:.3f}) {conf_label(sim)}")
+                     for i, (_, sim, pil) in enumerate(results)]
 
-            items = []
-            detail_lines = [
-                f'<div style="background:#fafafa;border:1px solid {sc};border-radius:6px;'
-                f'padding:12px;margin-bottom:12px">'
-                f'<b style="font-size:15px;color:{sc}">Top Match: {top_n}</b><br>'
-                f'<span style="color:#666;font-size:13px">{elapsed*1000:.0f}ms · '
-                f'Cosine similarity: {top_s:.3f}</span>'
-                f'</div>',
-                '<div style="font-size:13px">',
-            ]
+            # Auto-compute rows based on result count
+            g_rows = max(1, (len(items) + 4) // 5)
+            g_height = g_rows * 200
 
-            for i, (name, sim, pil) in enumerate(results):
-                items.append((pil, f"#{i+1} ({sim:.3f})"))
-                c = conf_color(sim)
-                detail_lines.append(
-                    f'<div style="display:flex;align-items:center;padding:2px 0;'
-                    f'border-bottom:1px solid #f5f5f5">'
-                    f'<span style="min-width:30px;font-weight:600">#{i+1}</span>'
-                    f'<span style="flex:1;font-size:12px;font-family:monospace">{html.escape(name)}</span>'
-                    f'{conf_bar(sim)}'
-                    f'<span style="margin-left:8px;font-size:11px;color:{c};min-width:70px">'
-                    f'{conf_label(sim)}</span></div>'
-                )
-
-            detail_lines.append('</div>')
-            return items, "\n".join(detail_lines)
-
-        def on_clear_html():
-            return f'<div style="color:#999;font-size:13px;padding:20px 0">Ready</div>'
+            return gr.update(value=items, rows=g_rows, height=g_height)
 
         def on_clear():
-            return None, on_clear_html()
+            return None
 
-        btn.click(on_search, inputs=[input_img, top_k], outputs=[gallery, result_html])
-        clear_btn.click(on_clear, outputs=[input_img, result_html])
+        btn.click(on_search, inputs=[input_img, top_k], outputs=[gallery])
+        clear_btn.click(on_clear, outputs=[input_img])
 
     return app
 
@@ -241,6 +191,9 @@ if __name__ == "__main__":
     print("=" * 50)
     print(" Fabric Pattern Matcher")
     print("=" * 50)
+    # Pre-load CLIP model before building UI
+    print("Pre-loading CLIP...")
+    get_clip()
     index = FabricIndex()
     index.build(args.fabric_dir)
     app = build_ui(index)
