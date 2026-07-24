@@ -124,12 +124,14 @@ def build_ui(index):
                 with gr.Row():
                     btn = gr.Button("Search", variant="primary", size="lg")
                     clear_btn = gr.Button("Clear", size="lg")
-                progress = gr.HTML('<div style="color:#999;padding:10px 0;font-size:13px">Ready</div>')
 
         gr.Markdown("---")
         gallery = gr.Gallery(label="Results", columns=5, rows="auto", height=640,
                              object_fit="contain", show_label=False)
-        detail = gr.HTML()
+        result_html = gr.HTML(
+            '<div style="color:#999;padding:10px 0;font-size:13px">'
+            f'Library: {len(index.names)} fabrics · CLIP ViT-B/32 · Ready</div>'
+        )
 
         def conf_label(s):
             if s > 0.85: return "Very High"
@@ -151,18 +153,19 @@ def build_ui(index):
                     f'<span style="display:inline-block;width:{pct}px;height:4px;background:{c};border-radius:2px"></span>')
 
         def on_search(img, k):
-            if img is None: return [], "", status_html("Upload a photo first", "#999")
+            if img is None:
+                return [], '<div style="color:#d32f2f">Upload a photo first</div>'
             if isinstance(img, dict):
                 img = img.get("composite") or img.get("background") or img
-            if img is None: return [], "", status_html("Upload a photo first", "#999")
+            if img is None:
+                return [], '<div style="color:#d32f2f">Upload a photo first</div>'
 
-            yield [], "", status_html("Extracting features...", "#999")
             t0 = time.time()
             try:
                 results = index.search(img, int(k))
             except Exception as e:
                 traceback.print_exc()
-                return [], "", status_html(f"Error: {e}", "#d32f2f")
+                return [], f'<div style="color:#d32f2f">Error: {html.escape(str(e))}</div>'
 
             elapsed = time.time() - t0
             top_n = html.escape(results[0][0]) if results else "-"
@@ -173,24 +176,30 @@ def build_ui(index):
             else: sc, st = "#d32f2f", "Low confidence"
 
             items = []
-            lines = [f'<div style="padding-bottom:8px"><b style="color:{sc}">{st}</b> '
-                     f'Top-1: <b>{top_n}</b> - {elapsed*1000:.0f}ms</div>']
+            lines = [
+                f'<div style="padding:8px 0;border-bottom:1px solid #eee;margin-bottom:8px">'
+                f'<b style="color:{sc};font-size:15px">{st}</b> &nbsp; '
+                f'<span style="color:#666">Top-1: {top_n} · {elapsed*1000:.0f}ms</span>'
+                f'</div>'
+            ]
             for i, (name, sim, pil) in enumerate(results):
                 items.append((pil, f"#{i+1} {conf_label(sim)} ({sim:.3f})"))
-                lines.append(f'<div style="padding:2px 0">'
-                             f'<b>#{i+1}</b> {html.escape(name)} {conf_bar(sim)}</div>')
+                lines.append(
+                    f'<div style="padding:3px 0;font-size:13px">'
+                    f'<b>#{i+1}</b> {html.escape(name)} &nbsp; {conf_bar(sim)}'
+                    f'</div>'
+                )
 
-            yield items, "\n".join(lines), status_html(
-                f"Done - {elapsed*1000:.0f}ms - Top-1: {top_n} ({top_s:.3f})", sc)
-
-        def status_html(msg, color):
-            return f'<div style="color:{color};padding:10px 0;font-size:13px">{msg}</div>'
+            return items, "\n".join(lines)
 
         def on_clear():
-            return None, "", status_html("Ready", "#999")
+            return None, (
+                '<div style="color:#999;padding:10px 0;font-size:13px">'
+                f'Library: {len(index.names)} fabrics · CLIP ViT-B/32 · Ready</div>'
+            )
 
-        btn.click(on_search, inputs=[input_img, top_k], outputs=[gallery, detail, progress])
-        clear_btn.click(on_clear, outputs=[input_img, detail, progress])
+        btn.click(on_search, inputs=[input_img, top_k], outputs=[gallery, result_html])
+        clear_btn.click(on_clear, outputs=[input_img, result_html])
 
     return app
 
