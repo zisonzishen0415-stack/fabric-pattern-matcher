@@ -54,7 +54,7 @@ class FabricIndex:
         files = sorted(os.listdir(fabric_dir))
         h = hashlib.md5("".join(files).encode()).hexdigest()[:8]
 
-        if not force and os.path.exists(cache_emb):
+        if not force and os.path.exists(cache_emb) and os.path.exists(cache_hash):
             with open(cache_hash) as f:
                 if f.read().strip() == h:
                     print(f"Loading cache ({len(files)} fabrics)...")
