@@ -136,15 +136,7 @@ class FabricIndex:
 # ============================================================
 
 def build_ui(index: FabricIndex):
-    css = """
-    .progress-wrap { margin: 12px 0; }
-    .progress-bar { height: 6px; background: #e0e0e0; border-radius: 3px; overflow: hidden; }
-    .progress-fill { height: 100%; background: #111; border-radius: 3px; transition: width 0.3s; }
-    .result-summary { font-size: 13px; color: #666; padding: 8px 0; border-bottom: 1px solid #eee; margin-bottom: 12px; }
-    footer { display: none !important; }
-    """
-
-    with gr.Blocks(css=css, theme=gr.themes.Monochrome(), title="Fabric Pattern Matcher") as app:
+    with gr.Blocks(title="Fabric Pattern Matcher") as app:
         gr.Markdown("## 面料花型匹配")
 
         with gr.Row(equal_height=True):
@@ -153,8 +145,9 @@ def build_ui(index: FabricIndex):
                     type="pil",
                     label="上传照片后，框选面料区域再检索",
                     height=360,
-                    crop_size=None,
                     transforms=["crop"],
+                    layers=False,
+                    brush=False,
                 )
             with gr.Column(scale=3):
                 with gr.Row():
@@ -289,4 +282,12 @@ if __name__ == "__main__":
     index = FabricIndex()
     index.build(args.fabric_dir)
     app = build_ui(index)
-    app.launch(server_port=args.port, share=args.share, inbrowser=True)
+    css = """
+    .progress-wrap { margin: 12px 0; }
+    .progress-bar { height: 6px; background: #e0e0e0; border-radius: 3px; overflow: hidden; }
+    .progress-fill { height: 100%; background: #111; border-radius: 3px; transition: width 0.3s; }
+    .result-summary { font-size: 13px; color: #666; padding: 8px 0; border-bottom: 1px solid #eee; margin-bottom: 12px; }
+    footer { display: none !important; }
+    """
+    app.launch(server_port=args.port, share=args.share, inbrowser=True,
+               theme=gr.themes.Monochrome(), css=css)
