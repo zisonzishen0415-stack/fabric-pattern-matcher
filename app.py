@@ -46,6 +46,8 @@ class FabricIndex:
 
     def build(self, fabric_dir, force=False):
         self._fabric_dir = os.path.abspath(fabric_dir)
+        if not os.path.isdir(self._fabric_dir):
+            raise FileNotFoundError(f"Directory not found: {self._fabric_dir}")
         cache_emb = os.path.join(self.cache_dir, "embeddings.npy")
         cache_names = os.path.join(self.cache_dir, "names.txt")
         cache_hash = os.path.join(self.cache_dir, "hash.txt")
@@ -101,37 +103,47 @@ class FabricIndex:
 # GUI
 # ============================================================
 def build_ui(index):
-    css = """
-    footer { display: none !important; }
-    .result-summary { font-size: 13px; color: #666; padding: 8px 0; border-bottom: 1px solid #eee; margin-bottom: 12px; }
-    """
-    with gr.Blocks(css=css, theme=gr.themes.Monochrome(), title="Fabric Pattern Matcher") as app:
+    n_fabrics = len(index.names)
+    with gr.Blocks(theme=gr.themes.Monochrome(), title="Fabric Pattern Matcher") as app:
         gr.Markdown("## Fabric Pattern Matcher")
 
-        with gr.Row():
-            with gr.Column(scale=1):
+        with gr.Row(equal_height=False):
+            # LEFT: upload + gallery
+            with gr.Column(scale=3):
                 input_img = gr.ImageEditor(
-                    type="pil", label="Upload photo, then crop fabric area",
-                    canvas_size=(800, 800), transforms=["crop"], brush=False, layers=False,
+                    type="pil",
+                    label="1. Upload photo, then click scissors icon to crop fabric area",
+                    canvas_size=(800, 800),
+                    transforms=["crop"],
+                    brush=False,
+                    layers=False,
                 )
-            with gr.Column(scale=1):
-                gr.Markdown(f"**Library**: {len(index.names)} fabrics | **Model**: CLIP ViT-B/32\n\n"
-                            "1. Upload photo on the left\n"
-                            "2. Click scissors icon (top-right)\n"
-                            "3. Drag handles to crop fabric area\n"
+
+                gallery = gr.Gallery(
+                    label="Matching Results",
+                    columns=5,
+                    rows="auto",
+                    height="100%",
+                    object_fit="contain",
+                    show_label=True,
+                    allow_preview=True,
+                    preview=True,
+                )
+
+            # RIGHT: controls + ranked list
+            with gr.Column(scale=2):
+                gr.Markdown(f"**Library**: {n_fabrics} fabrics  \n**Model**: CLIP ViT-B/32\n\n"
+                            "2. Drag handles to select fabric region  \n"
+                            "3. Choose result count  \n"
                             "4. Click Search")
                 top_k = gr.Slider(3, 50, value=15, step=1, label="Results count")
                 with gr.Row():
                     btn = gr.Button("Search", variant="primary", size="lg")
                     clear_btn = gr.Button("Clear", size="lg")
 
-        gr.Markdown("---")
-        gallery = gr.Gallery(label="Results", columns=5, rows="auto", height=640,
-                             object_fit="contain", show_label=False)
-        result_html = gr.HTML(
-            '<div style="color:#999;padding:10px 0;font-size:13px">'
-            f'Library: {len(index.names)} fabrics · CLIP ViT-B/32 · Ready</div>'
-        )
+                result_html = gr.HTML(
+                    f'<div style="color:#999;font-size:13px;padding:20px 0">Ready</div>'
+                )
 
         def conf_label(s):
             if s > 0.85: return "Very High"
@@ -149,54 +161,63 @@ def build_ui(index):
 
         def conf_bar(s):
             pct = min(int(s*100), 100); c = conf_color(s)
-            return (f'<span style="color:{c};font-weight:600">{pct}%</span> '
-                    f'<span style="display:inline-block;width:{pct}px;height:4px;background:{c};border-radius:2px"></span>')
+            return (f'<span style="display:inline-block;width:120px;height:4px;background:#e0e0e0;'
+                    f'border-radius:2px;vertical-align:middle;margin:0 6px">'
+                    f'<span style="display:block;width:{pct}%;height:100%;background:{c};border-radius:2px">'
+                    f'</span></span>'
+                    f'<span style="color:{c};font-weight:600;font-size:12px">{pct}%</span>')
 
         def on_search(img, k):
             if img is None:
-                return [], '<div style="color:#d32f2f">Upload a photo first</div>'
+                return [], on_clear_html()
             if isinstance(img, dict):
                 img = img.get("composite") or img.get("background") or img
             if img is None:
-                return [], '<div style="color:#d32f2f">Upload a photo first</div>'
+                return [], on_clear_html()
 
             t0 = time.time()
             try:
                 results = index.search(img, int(k))
             except Exception as e:
-                traceback.print_exc()
                 return [], f'<div style="color:#d32f2f">Error: {html.escape(str(e))}</div>'
 
             elapsed = time.time() - t0
             top_n = html.escape(results[0][0]) if results else "-"
             top_s = results[0][1] if results else 0
-
-            if top_s > 0.85: sc, st = "#2e7d32", "High confidence"
-            elif top_s > 0.65: sc, st = "#ff9800", "Medium confidence"
-            else: sc, st = "#d32f2f", "Low confidence"
+            sc = conf_color(top_s)
 
             items = []
-            lines = [
-                f'<div style="padding:8px 0;border-bottom:1px solid #eee;margin-bottom:8px">'
-                f'<b style="color:{sc};font-size:15px">{st}</b> &nbsp; '
-                f'<span style="color:#666">Top-1: {top_n} · {elapsed*1000:.0f}ms</span>'
-                f'</div>'
+            detail_lines = [
+                f'<div style="background:#fafafa;border:1px solid {sc};border-radius:6px;'
+                f'padding:12px;margin-bottom:12px">'
+                f'<b style="font-size:15px;color:{sc}">Top Match: {top_n}</b><br>'
+                f'<span style="color:#666;font-size:13px">{elapsed*1000:.0f}ms · '
+                f'Cosine similarity: {top_s:.3f}</span>'
+                f'</div>',
+                '<div style="font-size:13px">',
             ]
+
             for i, (name, sim, pil) in enumerate(results):
-                items.append((pil, f"#{i+1} {conf_label(sim)} ({sim:.3f})"))
-                lines.append(
-                    f'<div style="padding:3px 0;font-size:13px">'
-                    f'<b>#{i+1}</b> {html.escape(name)} &nbsp; {conf_bar(sim)}'
-                    f'</div>'
+                items.append((pil, f"#{i+1} ({sim:.3f})"))
+                c = conf_color(sim)
+                detail_lines.append(
+                    f'<div style="display:flex;align-items:center;padding:2px 0;'
+                    f'border-bottom:1px solid #f5f5f5">'
+                    f'<span style="min-width:30px;font-weight:600">#{i+1}</span>'
+                    f'<span style="flex:1;font-size:12px;font-family:monospace">{html.escape(name)}</span>'
+                    f'{conf_bar(sim)}'
+                    f'<span style="margin-left:8px;font-size:11px;color:{c};min-width:70px">'
+                    f'{conf_label(sim)}</span></div>'
                 )
 
-            return items, "\n".join(lines)
+            detail_lines.append('</div>')
+            return items, "\n".join(detail_lines)
+
+        def on_clear_html():
+            return f'<div style="color:#999;font-size:13px;padding:20px 0">Ready</div>'
 
         def on_clear():
-            return None, (
-                '<div style="color:#999;padding:10px 0;font-size:13px">'
-                f'Library: {len(index.names)} fabrics · CLIP ViT-B/32 · Ready</div>'
-            )
+            return None, on_clear_html()
 
         btn.click(on_search, inputs=[input_img, top_k], outputs=[gallery, result_html])
         clear_btn.click(on_clear, outputs=[input_img, result_html])
