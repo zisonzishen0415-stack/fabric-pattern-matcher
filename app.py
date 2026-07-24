@@ -2,7 +2,7 @@
 CLIP + FAISS fabric pattern matching GUI.
 Network needed only for first model download (~300MB).
 """
-import os, time, traceback, hashlib
+import os, time, traceback, hashlib, html
 import numpy as np
 import faiss
 import gradio as gr
@@ -222,10 +222,11 @@ def build_ui(index: FabricIndex):
                 summary_color = "#d32f2f"
                 summary_text = "置信度较低，请确认"
 
+            top_name = html.escape(results[0][0]) if results else "-"
             detail_lines = [
                 f'<div class="result-summary">'
                 f'<b style="color:{summary_color}">{summary_text}</b> · '
-                f'Top-1: <b>{results[0][0] if results else "-"}</b> · '
+                f'Top-1: <b>{top_name}</b> · '
                 f'耗时 {elapsed*1000:.0f}ms'
                 f'</div>'
             ]
@@ -237,12 +238,12 @@ def build_ui(index: FabricIndex):
                 detail_lines.append(
                     f'<div style="padding:4px 0">'
                     f'<span style="font-weight:600">#{i+1}</span> '
-                    f'<span style="font-family:monospace;font-size:13px">{name}</span> '
+                    f'<span style="font-family:monospace;font-size:13px">{html.escape(name)}</span> '
                     f'{bar}</div>'
                 )
 
             yield gallery_items, "\n".join(detail_lines), progress_html(
-                f"检索完成 · {elapsed*1000:.0f}ms · Top-1: {results[0][0] if results else '-'}",
+                f"检索完成 · {elapsed*1000:.0f}ms · Top-1: {top_name}",
                 summary_color
             )
 
