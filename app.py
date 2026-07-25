@@ -14,7 +14,7 @@ def _settings_path():
     return os.path.join(os.path.expanduser("~"), ".fabric_matcher", "settings.json")
 
 def load_settings():
-    defaults = {"top_k": 15, "color_weight": 0.3, "poc_weight": 0.2}
+    defaults = {"top_k": 15}
     try:
         path = _settings_path()
         if os.path.exists(path):
@@ -63,64 +63,11 @@ def extract_embedding(pil_img, model, preprocess):
     return vec
 
 # ============================================================
-# Color Histogram (for hybrid CLIP + color search)
-# ============================================================
-def extract_color_histogram(pil_img, bins_h=8, bins_s=4, bins_v=2):
-    """HSV joint histogram. H is lighting-invariant; fewer V bins → robust to
-    exposure/shadow differences. PIL-native, no cv2 needed.
-    Returns 8×4×2 = 64-dim normalized vector."""
-    arr = np.array(pil_img.convert('HSV'), dtype=np.uint8)
-    step_h = 256 // bins_h
-    step_s = 256 // bins_s
-    step_v = 256 // bins_v
-    q_h = np.clip(arr[:, :, 0] // step_h, 0, bins_h - 1)
-    q_s = np.clip(arr[:, :, 1] // step_s, 0, bins_s - 1)
-    q_v = np.clip(arr[:, :, 2] // step_v, 0, bins_v - 1)
-    indices = (q_h * bins_s * bins_v +
-               q_s * bins_v +
-               q_v)
-    hist = np.bincount(indices.ravel(), minlength=bins_h * bins_s * bins_v).astype(np.float32)
-    return hist / hist.sum()
-
-
-def color_similarity(h1, h2):
-    """Histogram intersection — 1.0 = identical colors, 0.0 = no overlap."""
-    return float(np.sum(np.minimum(h1, h2)))
-
-
-def poc_score(pil1, pil2, size=128):
-    """Phase-Only Correlation — structural/pattern similarity, lighting-invariant.
-    Pure numpy FFT, no cv2 needed. Returns peak value (higher = more similar pattern).
-    Typical: 0.02-0.05 = different, 0.1-0.3 = same pattern."""
-    g1 = np.array(pil1.resize((size, size), Image.LANCZOS).convert('L'), dtype=np.float64)
-    g2 = np.array(pil2.resize((size, size), Image.LANCZOS).convert('L'), dtype=np.float64)
-
-    # Hann window to suppress edge artifacts
-    wy = np.hanning(size)
-    wx = np.hanning(size)
-    window = np.outer(wy, wx)
-    g1 = g1 * window
-    g2 = g2 * window
-
-    # FFT → cross-power spectrum → normalise magnitude
-    f1 = np.fft.fft2(g1)
-    f2 = np.fft.fft2(g2)
-    eps = 1e-8
-    r = (f1 * np.conj(f2)) / (np.abs(f1) * np.abs(f2) + eps)
-
-    # Inverse FFT → correlation plane
-    poc = np.fft.fftshift(np.fft.ifft2(r).real)
-    return float(np.max(poc))
-
-
-# ============================================================
 # FAISS Index
 # ============================================================
 class FabricIndex:
     def __init__(self):
         self.names = []; self.embeddings = None; self.index = None
-        self.color_histograms = None  # (N, bins³) per-image color fingerprints
-        self._name_to_idx = {}        # filename → array index
 
     @property
     def cache_dir(self):
@@ -133,42 +80,29 @@ class FabricIndex:
         cache_emb = os.path.join(self.cache_dir, "embeddings.npy")
         cache_names = os.path.join(self.cache_dir, "names.txt")
         cache_hash = os.path.join(self.cache_dir, "hash.txt")
-        cache_color = os.path.join(self.cache_dir, "color_histograms.npy")
         os.makedirs(self.cache_dir, exist_ok=True)
 
         files = sorted([f for f in os.listdir(fabric_dir)
                        if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
         h = hashlib.md5("".join(files).encode()).hexdigest()[:8]
 
-        # ── CLIP cache ──
         if not force and os.path.exists(cache_emb) and os.path.exists(cache_hash):
             with open(cache_hash) as f:
                 if f.read().strip() == h:
                     print(f"Loading cache ({len(files)} fabrics)...")
                     self.embeddings = np.load(cache_emb)
                     self.names = [ln.strip() for ln in open(cache_names) if ln.strip()]
-                    self._rebuild_maps()
-                    # Color cache may exist or need building
-                    if os.path.exists(cache_color):
-                        self.color_histograms = np.load(cache_color)
-                        self._build_faiss()
-                        print(f"Ready: {len(self.names)} fabrics (color cached).")
-                        return self
-                    else:
-                        print("Building color histograms (CLIP cache OK)...")
-                        self._build_color_histograms(files, cache_color)
-                        self._build_faiss()
-                        print(f"Ready: {len(self.names)} fabrics (colors cached).")
-                        return self
+                    self._build_faiss()
+                    print(f"Ready: {len(self.names)} fabrics.")
+                    return self
 
         model, preprocess = get_clip()
         print(f"Extracting embeddings ({len(files)} fabrics)...")
-        vectors = []; color_hists = []
+        vectors = []
         for i, f in enumerate(files):
             try:
                 pil = Image.open(os.path.join(fabric_dir, f)).convert("RGB")
                 vectors.append(extract_embedding(pil, model, preprocess))
-                color_hists.append(extract_color_histogram(pil))
                 self.names.append(f)
             except: pass
             finally:
@@ -179,38 +113,12 @@ class FabricIndex:
                 gc.collect()
 
         self.embeddings = np.array(vectors, dtype=np.float32)
-        self.color_histograms = np.array(color_hists, dtype=np.float32)
         np.save(cache_emb, self.embeddings)
-        np.save(cache_color, self.color_histograms)
         open(cache_names,"w").write("\n".join(self.names))
         open(cache_hash,"w").write(h)
-        self._rebuild_maps()
         self._build_faiss()
-        print(f"Ready: {len(self.names)} fabrics (all cached).")
+        print(f"Ready: {len(self.names)} fabrics (cached).")
         return self
-
-    def _rebuild_maps(self):
-        self._name_to_idx = {n: i for i, n in enumerate(self.names)}
-
-    def _build_color_histograms(self, files, cache_path):
-        """Compute color histograms for cached CLIP index (backfill)."""
-        n = len(self.names)
-        print(f"Building color histograms ({n} fabrics)...")
-        hists = []
-        for i, fname in enumerate(self.names):
-            try:
-                pil = Image.open(os.path.join(self._fabric_dir, fname)).convert("RGB")
-                hists.append(extract_color_histogram(pil))
-            except Exception:
-                hists.append(np.zeros(64, dtype=np.float32))
-            finally:
-                try: pil.close()
-                except: pass
-            if (i + 1) % 500 == 0:
-                print(f"  color {i + 1}/{n}")
-                gc.collect()
-        self.color_histograms = np.array(hists, dtype=np.float32)
-        np.save(cache_path, self.color_histograms)
 
     def _build_faiss(self):
         if len(self.embeddings) == 0:
@@ -232,41 +140,6 @@ class FabricIndex:
                     pil = None
                 results.append((fname, float(s), pil))
         return results
-
-    def search_hybrid(self, pil_img, k=20, color_weight=0.3, poc_weight=0.2):
-        """CLIP + color histogram + POC structural verification.
-        color_weight=0 → pure CLIP, poc_weight=0 → no structural check."""
-        # ── Stage 1: CLIP fast retrieval ──
-        fetch_k = min(max(k * 3, k + 50), len(self.names))
-        clip_results = self.search(pil_img, fetch_k)
-
-        # ── Stage 2: color re-rank ──
-        if color_weight > 0.0 and self.color_histograms is not None:
-            query_hist = extract_color_histogram(pil_img)
-            scored = []
-            for fname, sim, pil in clip_results:
-                idx = self._name_to_idx.get(fname)
-                csim = color_similarity(query_hist, self.color_histograms[idx]) if idx is not None else 0.0
-                final = sim * (1.0 - color_weight) + csim * color_weight
-                scored.append((fname, final, pil))
-            scored.sort(key=lambda x: x[1], reverse=True)
-        else:
-            scored = clip_results
-
-        # ── Stage 3: POC structural check on final displayed results (fast, ~2ms/ea) ──
-        if poc_weight > 0.0:
-            display_n = min(k, len(scored))
-            for j in range(display_n):
-                fname, final, pil = scored[j]
-                if pil is not None:
-                    ps = poc_score(pil_img, pil)
-                    # POC peak ~0.02-0.05 for different, ~0.1-0.3 for same pattern
-                    # Normalise: clamp to [0, 0.25], scale to [0, 1]
-                    ps_norm = min(max(ps, 0.0), 0.25) / 0.25
-                    scored[j] = (fname, final + poc_weight * ps_norm, pil)
-            scored.sort(key=lambda x: x[1], reverse=True)
-
-        return scored[:k]
 
 # ============================================================
 # GUI Helpers
@@ -380,12 +253,38 @@ footer { display: none !important; }
 }
 
 /* Controls at row far right */
-#tb-dropdown { display: flex !important; align-items: center !important; gap: 6px !important; }
-#tb-color-slider { display: flex !important; align-items: center !important; gap: 6px !important; }
-#tb-dropdown label, #tb-color-slider label { margin: 0 !important; font-size: 12px !important; white-space: nowrap !important; color: #888 !important; font-weight: 400 !important; }
-#tb-dropdown .wrap, #tb-color-slider .wrap { flex: none !important; }
+#tb-dropdown, #tb-eval-toggle { display: flex !important; align-items: center !important; gap: 6px !important; }
+#tb-dropdown label, #tb-eval-toggle label { margin: 0 !important; font-size: 12px !important; white-space: nowrap !important; color: #888 !important; font-weight: 400 !important; }
+#tb-eval-toggle input { accent-color: #ff9800; }
+#tb-dropdown .wrap, #tb-eval-toggle .wrap { flex: none !important; }
 #tb-dropdown select, #tb-dropdown input { font-size: 13px !important; }
-#tb-color-slider input[type="range"] { accent-color: #4caf50; width: 80px; }
+
+/* ── Eval mode ── */
+#eval-panel { display: none; padding: 10px 18px; gap: 10px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #e8e8e8; }
+#eval-panel.show { display: flex; }
+#eval-preview { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+#eval-preview-img { width: 100px; height: 100px; object-fit: cover; border-radius: 6px; border: 2px solid #e8e8e8; }
+#eval-preview-label { font-size: 12px; color: #555; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#eval-buttons { display: flex; gap: 6px; }
+#eval-buttons button {
+  padding: 5px 12px; border-radius: 5px; cursor: pointer;
+  font-size: 12px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+#eval-export-btn { border: 1px solid #4caf50; background: #4caf50; color: #fff; }
+#eval-export-btn:hover { background: #43a047; }
+#eval-no-match-btn { border: 1px solid #e53935; background: #fff; color: #e53935; }
+#eval-no-match-btn:hover { background: #fff5f5; }
+#eval-prev-btn, #eval-next-btn { border: 1px solid #1976d2; background: #fff; color: #1976d2; }
+#eval-prev-btn:hover, #eval-next-btn:hover { background: #f0f7ff; }
+#eval-status { font-size: 11px; color: #888; }
+#results-grid .card .eval-radio-label {
+  display: none; align-items: center; justify-content: center; gap: 4px;
+  padding: 5px 8px; border-top: 1px solid #e8e8e8; background: #fafafa;
+  font-size: 11px; color: #666; cursor: pointer; user-select: none;
+}
+#results-grid .card .eval-radio-label input { accent-color: #4caf50; width: 14px; height: 14px; cursor: pointer; }
+#results-grid .card.eval-active { border-color: #4caf50; box-shadow: 0 0 0 2px rgba(76,175,80,0.3); }
+#results-grid .card.eval-active .eval-radio-label { background: #e8f5e9; color: #2e7d32; }
 
 /* ── Results ── */
 #results-wrap { padding: 14px 18px; min-height: calc(100vh - 80px); }
@@ -806,25 +705,29 @@ APP_JS = r"""
 
     if (!upBtn || !hiddenFile) return;
 
-    /* Click upload button → file dialog */
-    upBtn.addEventListener('click', function() { hiddenFile.click(); });
+    /* Click upload button → file dialog (multi-file) */
+    upBtn.addEventListener('click', function() { hiddenFile.multiple = true; hiddenFile.click(); });
 
-    /* File selected → FileReader → write dataURL to crop_b64 → trigger search.
-       We bypass input_img.change entirely because Gradio 5.23 doesn't fire it
-       on re-upload when the Image component is hidden. */
+    /* File selected → process all */
     hiddenFile.addEventListener('change', function() {
-      if (this.files && this.files[0]) {
-        var reader = new FileReader();
-        reader.onload = function(e) {
-          if (thumbImg) thumbImg.src = e.target.result;
-          if (thumbWrap) thumbWrap.classList.add('has-img');
-          if (upLabel) upLabel.textContent = 'Change photo';
-          // Write dataURL directly to hidden textarea; Gradio change event → search
-          setTextareaValue(e.target.result);
-        };
-        reader.readAsDataURL(this.files[0]);
+      var files = this.files;
+      if (!files || files.length === 0) return;
+      for (var fi = 0; fi < files.length; fi++) {
+        (function(file, idx, total) {
+          var reader = new FileReader();
+          reader.onload = function(e) {
+            var dataUrl = e.target.result;
+            if (idx === 0) {
+              if (thumbImg) thumbImg.src = dataUrl;
+              if (thumbWrap) thumbWrap.classList.add('has-img');
+              if (upLabel) upLabel.textContent = files.length > 1 ? (idx + 1) + '/' + total : 'Change photo';
+            }
+            window._evalNextFname = file.name || '';
+            setTextareaValue(dataUrl);
+          };
+          reader.readAsDataURL(file);
+        })(files[fi], fi, files.length);
       }
-      // Reset file input so re-selecting same file works
       var self = this;
       setTimeout(function() { self.value = ''; }, 500);
     });
@@ -890,6 +793,223 @@ APP_JS = r"""
       }).observe(resultsEl, { childList: true, subtree: true });
     }
 
+    /* ── Eval mode: simple mark-and-record ── */
+    var evalOn = false;
+    var sessionTrials = [];
+    var seenPhotoIds = {};
+    var evalPhotoList = [];     // [{b64, id, fname}]
+    var evalPhotoIdx = -1;
+
+    var evalPanel = document.createElement('div');
+    evalPanel.id = 'eval-panel';
+    evalPanel.innerHTML =
+      '<div id="eval-preview"><img id="eval-preview-img" src=""><span id="eval-preview-label"></span></div>' +
+      '<div id="eval-buttons">' +
+        '<button id="eval-no-match-btn">No Match</button>' +
+        '<button id="eval-prev-btn">◀ Prev</button>' +
+        '<button id="eval-next-btn">Next ▶</button>' +
+        '<button id="eval-export-btn">Export All</button>' +
+      '</div>' +
+      '<span id="eval-status"></span>';
+    if (resultsEl && resultsEl.parentNode) resultsEl.parentNode.insertBefore(evalPanel, resultsEl);
+
+    /* Helpers */
+    function photoHash(b64) {
+      var s = b64.length > 200 ? b64.substring(b64.length - 200) : b64;
+      var h = 0;
+      for (var i = 0; i < s.length; i++) { h = ((h << 5) - h + s.charCodeAt(i)) | 0; }
+      return (h >>> 0).toString(16).substring(0, 8).padStart(8, '0');
+    }
+    function showEvalRadios() {
+      var labels = document.querySelectorAll('#results-grid .eval-radio-label');
+      labels.forEach(function(l) { l.style.display = 'flex'; });
+    }
+
+    /* ── Load photo from list ── */
+    function loadPhotoAt(idx) {
+      if (idx < 0 || idx >= evalPhotoList.length) {
+        evalPhotoIdx = -1;
+        updatePreviewAndStatus();
+        return;
+      }
+      evalPhotoIdx = idx;
+      var p = evalPhotoList[idx];
+      // Eval panel preview
+      document.getElementById('eval-preview-img').src = p.b64;
+      document.getElementById('eval-preview-label').textContent = (idx + 1) + '/' + evalPhotoList.length + ' ' + (p.fname || p.id);
+      // Also update top-bar thumbnail
+      var ti = document.getElementById('thumb-img');
+      var tw = document.getElementById('thumb-wrap');
+      var ul = document.getElementById('upload-btn-label');
+      if (ti) ti.src = p.b64;
+      if (tw) tw.classList.add('has-img');
+      if (ul) ul.textContent = (idx + 1) + '/' + evalPhotoList.length;
+      updatePreviewAndStatus();
+      // Bypass intercept — trigger real search
+      _origSetTA(p.b64);
+    }
+
+    function prevPhoto() {
+      if (evalPhotoIdx > 0) loadPhotoAt(evalPhotoIdx - 1);
+    }
+    function nextPhoto() {
+      if (evalPhotoIdx + 1 < evalPhotoList.length) loadPhotoAt(evalPhotoIdx + 1);
+    }
+
+    /* ── Gradio Eval checkbox ── */
+    var evalCBEl = null;
+    function findEvalCheckbox() {
+      var w = document.getElementById('tb-eval-toggle');
+      return w ? w.querySelector('input[type="checkbox"]') : null;
+    }
+    function syncEvalState() {
+      var cb = findEvalCheckbox();
+      if (!cb) return;
+      evalCBEl = cb;
+      var wasOn = evalOn;
+      evalOn = cb.checked;
+      if (evalOn && !wasOn) { evalPanel.classList.add('show'); }
+      else if (!evalOn && wasOn) { evalPanel.classList.remove('show'); }
+      updatePreviewAndStatus();
+    }
+    var evalCheckWrap = document.getElementById('tb-eval-toggle');
+    if (evalCheckWrap) {
+      new MutationObserver(function() {
+        var cb = findEvalCheckbox();
+        if (cb && cb !== evalCBEl) { evalCBEl = cb; cb.addEventListener('change', syncEvalState); syncEvalState(); }
+      }).observe(evalCheckWrap, { childList: true, subtree: true });
+    }
+    new MutationObserver(function() {
+      var cb = findEvalCheckbox();
+      if (cb && cb !== evalCBEl) { evalCBEl = cb; cb.addEventListener('change', syncEvalState); syncEvalState(); }
+    }).observe(document.body, { childList: true, subtree: true });
+
+    /* ── Intercept uploads → add to list ── */
+    var _origSetTA = setTextareaValue;
+    window._evalIntercept = function(b64) {
+      if (!evalOn || !b64 || b64.length < 100) return false;
+      // Don't intercept crop results (plain base64 without data: prefix)
+      if (b64.indexOf('data:') !== 0) return false;
+      var fname = window._evalNextFname || '';
+      window._evalNextFname = '';
+      var pid = photoHash(b64);
+      if (!seenPhotoIds[pid]) seenPhotoIds[pid] = new Date().toISOString();
+      // Dedup
+      for (var i = 0; i < evalPhotoList.length; i++) { if (evalPhotoList[i].id === pid) return true; /* already there */ }
+      evalPhotoList.push({b64: b64, id: pid, fname: fname});
+      if (evalPhotoList.length === 1 && evalPhotoIdx < 0) {
+        loadPhotoAt(0);
+      } else {
+        updatePreviewAndStatus();
+      }
+      return true;
+    };
+    setTextareaValue = function (val) {
+      if (window._evalIntercept(val)) return;
+      _origSetTA(val);
+    };
+
+    /* ── Log ── */
+    function logTrial(radio) {
+      var card = radio.closest('.card');
+      if (!card) return;
+      card.classList.add('eval-active');
+      var p = evalPhotoIdx >= 0 && evalPhotoIdx < evalPhotoList.length ? evalPhotoList[evalPhotoIdx] : null;
+      sessionTrials.push({
+        timestamp: new Date().toISOString(),
+        photo_id: p ? p.id : 'none',
+        query_fname: p ? p.fname : '',
+        photo_index: evalPhotoIdx,
+        result_count: document.querySelectorAll('#results-grid .card').length,
+        correct_rank: parseInt(card.getAttribute('data-rank') || '0'),
+        correct_name: card.getAttribute('data-fname') || '',
+        clip_sim: parseFloat(card.getAttribute('data-sim') || '0')
+      });
+      updatePreviewAndStatus();
+    }
+    function logNoMatch() {
+      var p = evalPhotoIdx >= 0 && evalPhotoIdx < evalPhotoList.length ? evalPhotoList[evalPhotoIdx] : null;
+      if (!p) return;
+      sessionTrials.push({
+        timestamp: new Date().toISOString(),
+        photo_id: p.id,
+        query_fname: p.fname,
+        photo_index: evalPhotoIdx,
+        result_count: document.querySelectorAll('#results-grid .card').length,
+        correct_rank: -1,
+        correct_name: '',
+        clip_sim: 0
+      });
+      updatePreviewAndStatus();
+    }
+
+    function updateEvalCardHighlight() {
+      var cards = document.querySelectorAll('#results-grid .card');
+      cards.forEach(function(c) { c.classList.remove('eval-active'); });
+      var checked = document.querySelector('#results-grid .eval-cb:checked');
+      if (checked) { var card = checked.closest('.card'); if (card) card.classList.add('eval-active'); }
+    }
+
+    function updatePreviewAndStatus() {
+      var st = document.getElementById('eval-status');
+      var prev = document.getElementById('eval-preview');
+      if (!evalOn) {
+        if (prev) prev.style.display = 'none';
+        if (st) st.textContent = '';
+        return;
+      }
+      if (prev) prev.style.display = 'flex';
+      var n = evalPhotoList.length;
+      var idx = evalPhotoIdx;
+      var p = (idx >= 0 && idx < n) ? evalPhotoList[idx] : null;
+      if (st) {
+        if (n === 0) {
+          st.textContent = 'Upload photos — ' + sessionTrials.length + ' trials logged';
+        } else if (p) {
+          st.textContent = sessionTrials.length + ' trials / ' + Object.keys(seenPhotoIds).length + ' photos';
+        } else {
+          st.textContent = Object.keys(seenPhotoIds).length + ' photos loaded — ' + sessionTrials.length + ' trials';
+        }
+      }
+    }
+
+    function exportAllTrials() {
+      if (sessionTrials.length === 0) { alert('No trials yet.'); return; }
+      var blob = new Blob([JSON.stringify({unique_photos: Object.keys(seenPhotoIds).length, total_trials: sessionTrials.length, trials: sessionTrials}, null, 2)], {type: 'application/json'});
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url; a.download = 'eval-session-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+      a.click(); URL.revokeObjectURL(url);
+    }
+
+    /* Events */
+    document.addEventListener('change', function(e) {
+      if (!evalOn) return;
+      if (!e.target || !e.target.classList.contains('eval-cb')) return;
+      updateEvalCardHighlight();
+      logTrial(e.target);
+    });
+    document.getElementById('eval-export-btn').addEventListener('click', exportAllTrials);
+    document.getElementById('eval-no-match-btn').addEventListener('click', logNoMatch);
+    document.getElementById('eval-prev-btn').addEventListener('click', prevPhoto);
+    document.getElementById('eval-next-btn').addEventListener('click', nextPhoto);
+
+    /* Watch body → re-show radios after results reload */
+    var bodyWatcher = new MutationObserver(function() {
+      if (!evalOn) return;
+      clearTimeout(bodyWatcher._tid);
+      bodyWatcher._tid = setTimeout(function() {
+        var grid = document.getElementById('results-grid');
+        if (!grid) return;
+        var labels = grid.querySelectorAll('.eval-radio-label');
+        if (labels.length > 0 && getComputedStyle(labels[0]).display === 'none') {
+          showEvalRadios();
+        }
+        updatePreviewAndStatus();
+      }, 150);
+    });
+    bodyWatcher.observe(document.body, { childList: true, subtree: true });
+
     self.disconnect();
   });
   obs.observe(document.body, { childList: true, subtree: true });
@@ -904,8 +1024,6 @@ def build_ui(index):
     logo_b64_str = _logo_b64()
     settings = load_settings()
     default_k = settings.get("top_k", 15)
-    default_color_w = settings.get("color_weight", 0.3)
-    default_poc_w = settings.get("poc_weight", 0.2)
 
     top_bar_html = make_top_bar_html(n_fabrics, logo_b64_str)
 
@@ -924,10 +1042,9 @@ def build_ui(index):
                     label="Results", interactive=True,
                     elem_id="tb-dropdown",
                 )
-                color_weight = gr.Slider(
-                    minimum=0.0, maximum=1.0, value=default_color_w,
-                    step=0.05, label="Color", interactive=True,
-                    elem_id="tb-color-slider",
+                eval_mode = gr.Checkbox(
+                    value=False, label="Eval", interactive=True,
+                    elem_id="tb-eval-toggle",
                 )
 
         # ── Hidden data pipe components ──
@@ -948,7 +1065,7 @@ def build_ui(index):
                 return "", EMPTY_STATE
             return "data:image/jpeg;base64," + pil_to_b64(pil_img, quality=90)
 
-        def on_search(b64_val, k_val, color_w):
+        def on_search(b64_val, k_val):
             if not b64_val or not b64_val.strip():
                 return EMPTY_STATE
             try:
@@ -962,9 +1079,8 @@ def build_ui(index):
                 s = max(224.0 / w, 224.0 / h)
                 img = img.resize((int(w * s), int(h * s)), Image.LANCZOS)
             t0 = time.time()
-            poc_w = float(default_poc_w)
             try:
-                results = index.search_hybrid(img, int(k_val), float(color_w), poc_w)
+                results = index.search(img, int(k_val))
             except Exception:
                 return """<div class="empty-state"><div style="color:#d32f2f">Search error</div></div>"""
             elapsed_ms = (time.time() - t0) * 1000
@@ -978,13 +1094,14 @@ def build_ui(index):
                     continue
                 cc = conf_color(sim)
                 cards.append(
-                    f'<div class="card">'
+                    f'<div class="card" data-fname="{html.escape(name)}" data-sim="{sim:.4f}" data-rank="{i+1}">'
                     f'<div class="img-wrap"><img src="data:image/jpeg;base64,{card_b64}" alt="{html.escape(name)}" loading="lazy"></div>'
                     f'<div class="info">'
                     f'<span class="rank-num" style="color:{cc}">#{i+1}</span> '
                     f'<span style="color:{cc}">{sim:.3f}</span> {conf_label(sim)}'
                     f'<span class="fname">{html.escape(name)}</span>'
-                    f'</div></div>'
+                    f'</div><label class="eval-radio-label"><input type="radio" name="eval-correct" class="eval-cb" value="{html.escape(name)}">Correct</label>'
+                    f'</div>'
                 )
             return (
                 f'<div id="results-meta">{len(results)} results &middot; {elapsed_ms:.0f}ms</div>'
@@ -994,37 +1111,20 @@ def build_ui(index):
         def on_top_k_change(k_val):
             save_settings({"top_k": int(k_val)})
 
-        def on_color_weight_change(cw_val):
-            save_settings({"color_weight": float(cw_val)})
+        # ── Event wiring ──
 
-        # ── Event wiring ──────────────────────────────────────
-        # All uploads (click/drag/paste) write dataURL directly to crop_b64
-        # via JS FileReader → setTextareaValue(). Gradio change event triggers search.
-
-        # Textbox value change → search (the ONLY path to search)
         crop_b64.change(
             on_search,
-            inputs=[crop_b64, top_k, color_weight],
+            inputs=[crop_b64, top_k],
             outputs=[results_html]
         )
 
-        # Top-k change → save + re-search
         top_k.change(
             on_top_k_change,
             inputs=[top_k], outputs=None
         ).then(
             on_search,
-            inputs=[crop_b64, top_k, color_weight],
-            outputs=[results_html]
-        )
-
-        # Color weight change → save + re-search (no re-upload needed)
-        color_weight.change(
-            on_color_weight_change,
-            inputs=[color_weight], outputs=None
-        ).then(
-            on_search,
-            inputs=[crop_b64, top_k, color_weight],
+            inputs=[crop_b64, top_k],
             outputs=[results_html]
         )
 
