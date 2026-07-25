@@ -4,9 +4,7 @@
 
 ## 演示
 
-<video autoplay loop muted playsinline controls width="100%">
-  <source src="https://github.com/zisonzishen0415-stack/fabric-pattern-matcher/releases/download/demo/default.mp4" type="video/mp4">
-</video>
+[📹 观看演示视频](https://github.com/zisonzishen0415-stack/fabric-pattern-matcher/releases/tag/demo)
 
 ## 技术架构
 
