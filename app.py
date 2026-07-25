@@ -126,19 +126,56 @@ class FabricIndex:
         self.index = faiss.IndexFlatIP(self.embeddings.shape[1])
         self.index.add(self.embeddings)
 
+    def _query_views(self, pil_img):
+        """Generate multiple crops + flip to overcome single-pattern vs full-repeat mismatch."""
+        w, h = pil_img.size
+        views = [pil_img]
+        # 5 overlapping crops at 75% of original dimensions
+        cw, ch = int(w * 0.75), int(h * 0.75)
+        positions = [
+            (0, 0),                        # top-left
+            (w - cw, 0),                   # top-right
+            (0, h - ch),                   # bottom-left
+            (w - cw, h - ch),              # bottom-right
+            ((w - cw) // 2, (h - ch) // 2) # center
+        ]
+        for x, y in positions:
+            views.append(pil_img.crop((x, y, x + cw, y + ch)))
+        # Horizontal flip (fabric patterns are often symmetric)
+        views.append(pil_img.transpose(Image.FLIP_LEFT_RIGHT))
+        if cw >= 100 and ch >= 100:
+            views.append(pil_img.crop((0, 0, cw, ch)).transpose(Image.FLIP_LEFT_RIGHT))
+        return views
+
     def search(self, pil_img, k=20):
+        import torch
         model, preprocess = get_clip()
-        q = extract_embedding(pil_img, model, preprocess)
-        sims, idxs = self.index.search(q.reshape(1,-1), k)
+        views = self._query_views(pil_img)
+        # Batch all views → single CLIP forward pass
+        tensors = torch.stack([preprocess(v) for v in views]).to(_device)
+        with torch.no_grad():
+            emb = model.encode_image(tensors)
+            emb = emb / emb.norm(dim=-1, keepdim=True)
+        embs = emb.cpu().numpy().astype(np.float32)
+        del tensors, emb
+        # Search each view, keep best sim per fabric
+        best = {}
+        for q in embs:
+            sims, idxs = self.index.search(q.reshape(1,-1), k * 2)
+            for s, i in zip(sims[0], idxs[0]):
+                if 0 <= i < len(self.names):
+                    fname = self.names[i]
+                    fs = float(s)
+                    if fname not in best or fs > best[fname]:
+                        best[fname] = fs
+        ranked = sorted(best.items(), key=lambda x: x[1], reverse=True)[:k]
         results = []
-        for s, i in zip(sims[0], idxs[0]):
-            if 0 <= i < len(self.names):
-                fname = self.names[i]
-                try:
-                    pil = Image.open(os.path.join(self._fabric_dir, fname)).convert("RGB")
-                except Exception:
-                    pil = None
-                results.append((fname, float(s), pil))
+        for fname, sim in ranked:
+            try:
+                pil = Image.open(os.path.join(self._fabric_dir, fname)).convert("RGB")
+            except Exception:
+                pil = None
+            results.append((fname, sim, pil))
         return results
 
 # ============================================================
@@ -253,40 +290,13 @@ footer { display: none !important; }
 }
 
 /* Controls at row far right */
-#tb-dropdown, #tb-eval-toggle { display: flex !important; align-items: center !important; gap: 6px !important; }
-#tb-dropdown label, #tb-eval-toggle label { margin: 0 !important; font-size: 12px !important; white-space: nowrap !important; color: #888 !important; font-weight: 400 !important; }
-#tb-eval-toggle input { accent-color: #ff9800; }
-#tb-dropdown .wrap, #tb-eval-toggle .wrap { flex: none !important; }
+#tb-dropdown { display: flex !important; align-items: center !important; gap: 6px !important; }
+#tb-dropdown label { margin: 0 !important; font-size: 12px !important; white-space: nowrap !important; color: #888 !important; font-weight: 400 !important; }
+#tb-dropdown .wrap { flex: none !important; }
 #tb-dropdown select, #tb-dropdown input { font-size: 13px !important; }
 
-/* ── Eval mode ── */
-#eval-panel { display: none; padding: 10px 18px; gap: 10px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #e8e8e8; }
-#eval-panel.show { display: flex; }
-#eval-preview { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-#eval-preview-img { width: 100px; height: 100px; object-fit: cover; border-radius: 6px; border: 2px solid #e8e8e8; }
-#eval-preview-label { font-size: 12px; color: #555; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#eval-buttons { display: flex; gap: 6px; }
-#eval-buttons button {
-  padding: 5px 12px; border-radius: 5px; cursor: pointer;
-  font-size: 12px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-}
-#eval-export-btn { border: 1px solid #4caf50; background: #4caf50; color: #fff; }
-#eval-export-btn:hover { background: #43a047; }
-#eval-no-match-btn { border: 1px solid #e53935; background: #fff; color: #e53935; }
-#eval-no-match-btn:hover { background: #fff5f5; }
-#eval-prev-btn, #eval-next-btn { border: 1px solid #1976d2; background: #fff; color: #1976d2; }
-#eval-prev-btn:hover, #eval-next-btn:hover { background: #f0f7ff; }
-#eval-status { font-size: 11px; color: #888; }
-#results-grid .card .eval-radio-label {
-  display: none; align-items: center; justify-content: center; gap: 4px;
-  padding: 5px 8px; border-top: 1px solid #e8e8e8; background: #fafafa;
-  font-size: 11px; color: #666; cursor: pointer; user-select: none;
-}
-#results-grid .card .eval-radio-label input { accent-color: #4caf50; width: 14px; height: 14px; cursor: pointer; }
-#results-grid .card.eval-active { border-color: #4caf50; box-shadow: 0 0 0 2px rgba(76,175,80,0.3); }
-#results-grid .card.eval-active .eval-radio-label { background: #e8f5e9; color: #2e7d32; }
+/* Results */
 
-/* ── Results ── */
 #results-wrap { padding: 14px 18px; min-height: calc(100vh - 80px); }
 #results-meta { font-size: 12px; color: #999; padding-bottom: 10px; }
 #results-grid {
@@ -563,9 +573,8 @@ APP_JS = r"""
     '<button class="crop-close" id="crop-close-btn">&times;</button>' +
     '<h3>Crop &amp; Search</h3>' +
     '<canvas id="crop-canvas"></canvas>' +
-    '<div class="crop-hint">Drag to select fabric area, then confirm</div>' +
+    '<div class="crop-hint">Drag to select fabric area, then Confirm Search</div>' +
     '<div class="crop-actions">' +
-    '<button id="crop-reset-btn">Reset</button>' +
     '<button class="btn-confirm" id="crop-confirm-btn">Confirm Search</button>' +
     '</div></div>';
   document.body.appendChild(cm);
@@ -573,7 +582,7 @@ APP_JS = r"""
   cm.addEventListener('click', function(e) { if (e.target === cm) closeCrop(); });
 
   /* ── Crop state ── */
-  var crop = { img: null, ow: 0, oh: 0, dw: 0, dh: 0, cropped: null };
+  var crop = { img: null, ow: 0, oh: 0, dw: 0, dh: 0, cropped: null, used: false };
   var cSX = 0, cSY = 0, cEX = 0, cEY = 0, cDragging = false;
   var cropWired = false;
 
@@ -633,19 +642,18 @@ APP_JS = r"""
       ctx.drawImage(crop.img, 0, 0, crop.dw, crop.dh);
       ctx.strokeStyle = '#4caf50'; ctx.lineWidth = 2;
       ctx.strokeRect(rx, ry, rw, rh);
-      // Write to hidden textarea; Gradio's Svelte bind:value picks up the input event
+      // Dragged a crop → search immediately + close modal
       setTextareaValue(crop.cropped);
+      crop.used = true;
+      cm.classList.remove('active');
     }
 
     document.getElementById('crop-confirm-btn').addEventListener('click', function() {
-      if (crop.cropped) setTextareaValue(crop.cropped);
+      if (!crop.used && crop.cropped) {
+        setTextareaValue(crop.cropped);
+        crop.used = true;
+      }
       closeCrop();
-    });
-    document.getElementById('crop-reset-btn').addEventListener('click', function() {
-      crop.cropped = null;
-      var ctx = c.getContext('2d');
-      ctx.clearRect(0, 0, crop.dw, crop.dh);
-      ctx.drawImage(crop.img, 0, 0, crop.dw, crop.dh);
     });
   }
 
@@ -660,7 +668,20 @@ APP_JS = r"""
     }
   }
 
-  function closeCrop() { cm.classList.remove('active'); }
+  function closeCrop() {
+    cm.classList.remove('active');
+    if (!crop.used) {
+      // × pressed with a pending crop → use it
+      if (crop.cropped) {
+        setTextareaValue(crop.cropped);
+        crop.used = true;
+      } else {
+        // No crop at all → use full image
+        var thumb = document.getElementById('thumb-img');
+        if (thumb && thumb.src) setTextareaValue(thumb.src);
+      }
+    }
+  }
 
   window.openCropModal = function() {
     var thumb = document.getElementById('thumb-img');
@@ -676,7 +697,7 @@ APP_JS = r"""
       crop.dw = Math.round(crop.ow * sc); crop.dh = Math.round(crop.oh * sc);
       c.width = crop.dw; c.height = crop.dh;
       c.getContext('2d').drawImage(crop.img, 0, 0, crop.dw, crop.dh);
-      crop.cropped = null;
+      crop.cropped = null; crop.used = false;
       cm.classList.add('active');
     };
     crop.img.src = thumb.src;
@@ -708,25 +729,18 @@ APP_JS = r"""
     /* Click upload button → file dialog (multi-file) */
     upBtn.addEventListener('click', function() { hiddenFile.multiple = true; hiddenFile.click(); });
 
-    /* File selected → process all */
+    /* File selected → search */
     hiddenFile.addEventListener('change', function() {
-      var files = this.files;
-      if (!files || files.length === 0) return;
-      for (var fi = 0; fi < files.length; fi++) {
-        (function(file, idx, total) {
-          var reader = new FileReader();
-          reader.onload = function(e) {
-            var dataUrl = e.target.result;
-            if (idx === 0) {
-              if (thumbImg) thumbImg.src = dataUrl;
-              if (thumbWrap) thumbWrap.classList.add('has-img');
-              if (upLabel) upLabel.textContent = files.length > 1 ? (idx + 1) + '/' + total : 'Change photo';
-            }
-            window._evalNextFname = file.name || '';
-            setTextareaValue(dataUrl);
-          };
-          reader.readAsDataURL(file);
-        })(files[fi], fi, files.length);
+      if (this.files && this.files[0]) {
+        var reader = new FileReader();
+        reader.onload = function(e) {
+          if (thumbImg) thumbImg.src = e.target.result;
+          if (thumbWrap) thumbWrap.classList.add('has-img');
+          if (upLabel) upLabel.textContent = 'Change photo';
+          // Don't search yet — open crop modal first
+          window.openCropModal();
+        };
+        reader.readAsDataURL(this.files[0]);
       }
       var self = this;
       setTimeout(function() { self.value = ''; }, 500);
@@ -793,223 +807,6 @@ APP_JS = r"""
       }).observe(resultsEl, { childList: true, subtree: true });
     }
 
-    /* ── Eval mode: simple mark-and-record ── */
-    var evalOn = false;
-    var sessionTrials = [];
-    var seenPhotoIds = {};
-    var evalPhotoList = [];     // [{b64, id, fname}]
-    var evalPhotoIdx = -1;
-
-    var evalPanel = document.createElement('div');
-    evalPanel.id = 'eval-panel';
-    evalPanel.innerHTML =
-      '<div id="eval-preview"><img id="eval-preview-img" src=""><span id="eval-preview-label"></span></div>' +
-      '<div id="eval-buttons">' +
-        '<button id="eval-no-match-btn">No Match</button>' +
-        '<button id="eval-prev-btn">◀ Prev</button>' +
-        '<button id="eval-next-btn">Next ▶</button>' +
-        '<button id="eval-export-btn">Export All</button>' +
-      '</div>' +
-      '<span id="eval-status"></span>';
-    if (resultsEl && resultsEl.parentNode) resultsEl.parentNode.insertBefore(evalPanel, resultsEl);
-
-    /* Helpers */
-    function photoHash(b64) {
-      var s = b64.length > 200 ? b64.substring(b64.length - 200) : b64;
-      var h = 0;
-      for (var i = 0; i < s.length; i++) { h = ((h << 5) - h + s.charCodeAt(i)) | 0; }
-      return (h >>> 0).toString(16).substring(0, 8).padStart(8, '0');
-    }
-    function showEvalRadios() {
-      var labels = document.querySelectorAll('#results-grid .eval-radio-label');
-      labels.forEach(function(l) { l.style.display = 'flex'; });
-    }
-
-    /* ── Load photo from list ── */
-    function loadPhotoAt(idx) {
-      if (idx < 0 || idx >= evalPhotoList.length) {
-        evalPhotoIdx = -1;
-        updatePreviewAndStatus();
-        return;
-      }
-      evalPhotoIdx = idx;
-      var p = evalPhotoList[idx];
-      // Eval panel preview
-      document.getElementById('eval-preview-img').src = p.b64;
-      document.getElementById('eval-preview-label').textContent = (idx + 1) + '/' + evalPhotoList.length + ' ' + (p.fname || p.id);
-      // Also update top-bar thumbnail
-      var ti = document.getElementById('thumb-img');
-      var tw = document.getElementById('thumb-wrap');
-      var ul = document.getElementById('upload-btn-label');
-      if (ti) ti.src = p.b64;
-      if (tw) tw.classList.add('has-img');
-      if (ul) ul.textContent = (idx + 1) + '/' + evalPhotoList.length;
-      updatePreviewAndStatus();
-      // Bypass intercept — trigger real search
-      _origSetTA(p.b64);
-    }
-
-    function prevPhoto() {
-      if (evalPhotoIdx > 0) loadPhotoAt(evalPhotoIdx - 1);
-    }
-    function nextPhoto() {
-      if (evalPhotoIdx + 1 < evalPhotoList.length) loadPhotoAt(evalPhotoIdx + 1);
-    }
-
-    /* ── Gradio Eval checkbox ── */
-    var evalCBEl = null;
-    function findEvalCheckbox() {
-      var w = document.getElementById('tb-eval-toggle');
-      return w ? w.querySelector('input[type="checkbox"]') : null;
-    }
-    function syncEvalState() {
-      var cb = findEvalCheckbox();
-      if (!cb) return;
-      evalCBEl = cb;
-      var wasOn = evalOn;
-      evalOn = cb.checked;
-      if (evalOn && !wasOn) { evalPanel.classList.add('show'); }
-      else if (!evalOn && wasOn) { evalPanel.classList.remove('show'); }
-      updatePreviewAndStatus();
-    }
-    var evalCheckWrap = document.getElementById('tb-eval-toggle');
-    if (evalCheckWrap) {
-      new MutationObserver(function() {
-        var cb = findEvalCheckbox();
-        if (cb && cb !== evalCBEl) { evalCBEl = cb; cb.addEventListener('change', syncEvalState); syncEvalState(); }
-      }).observe(evalCheckWrap, { childList: true, subtree: true });
-    }
-    new MutationObserver(function() {
-      var cb = findEvalCheckbox();
-      if (cb && cb !== evalCBEl) { evalCBEl = cb; cb.addEventListener('change', syncEvalState); syncEvalState(); }
-    }).observe(document.body, { childList: true, subtree: true });
-
-    /* ── Intercept uploads → add to list ── */
-    var _origSetTA = setTextareaValue;
-    window._evalIntercept = function(b64) {
-      if (!evalOn || !b64 || b64.length < 100) return false;
-      // Don't intercept crop results (plain base64 without data: prefix)
-      if (b64.indexOf('data:') !== 0) return false;
-      var fname = window._evalNextFname || '';
-      window._evalNextFname = '';
-      var pid = photoHash(b64);
-      if (!seenPhotoIds[pid]) seenPhotoIds[pid] = new Date().toISOString();
-      // Dedup
-      for (var i = 0; i < evalPhotoList.length; i++) { if (evalPhotoList[i].id === pid) return true; /* already there */ }
-      evalPhotoList.push({b64: b64, id: pid, fname: fname});
-      if (evalPhotoList.length === 1 && evalPhotoIdx < 0) {
-        loadPhotoAt(0);
-      } else {
-        updatePreviewAndStatus();
-      }
-      return true;
-    };
-    setTextareaValue = function (val) {
-      if (window._evalIntercept(val)) return;
-      _origSetTA(val);
-    };
-
-    /* ── Log ── */
-    function logTrial(radio) {
-      var card = radio.closest('.card');
-      if (!card) return;
-      card.classList.add('eval-active');
-      var p = evalPhotoIdx >= 0 && evalPhotoIdx < evalPhotoList.length ? evalPhotoList[evalPhotoIdx] : null;
-      sessionTrials.push({
-        timestamp: new Date().toISOString(),
-        photo_id: p ? p.id : 'none',
-        query_fname: p ? p.fname : '',
-        photo_index: evalPhotoIdx,
-        result_count: document.querySelectorAll('#results-grid .card').length,
-        correct_rank: parseInt(card.getAttribute('data-rank') || '0'),
-        correct_name: card.getAttribute('data-fname') || '',
-        clip_sim: parseFloat(card.getAttribute('data-sim') || '0')
-      });
-      updatePreviewAndStatus();
-    }
-    function logNoMatch() {
-      var p = evalPhotoIdx >= 0 && evalPhotoIdx < evalPhotoList.length ? evalPhotoList[evalPhotoIdx] : null;
-      if (!p) return;
-      sessionTrials.push({
-        timestamp: new Date().toISOString(),
-        photo_id: p.id,
-        query_fname: p.fname,
-        photo_index: evalPhotoIdx,
-        result_count: document.querySelectorAll('#results-grid .card').length,
-        correct_rank: -1,
-        correct_name: '',
-        clip_sim: 0
-      });
-      updatePreviewAndStatus();
-    }
-
-    function updateEvalCardHighlight() {
-      var cards = document.querySelectorAll('#results-grid .card');
-      cards.forEach(function(c) { c.classList.remove('eval-active'); });
-      var checked = document.querySelector('#results-grid .eval-cb:checked');
-      if (checked) { var card = checked.closest('.card'); if (card) card.classList.add('eval-active'); }
-    }
-
-    function updatePreviewAndStatus() {
-      var st = document.getElementById('eval-status');
-      var prev = document.getElementById('eval-preview');
-      if (!evalOn) {
-        if (prev) prev.style.display = 'none';
-        if (st) st.textContent = '';
-        return;
-      }
-      if (prev) prev.style.display = 'flex';
-      var n = evalPhotoList.length;
-      var idx = evalPhotoIdx;
-      var p = (idx >= 0 && idx < n) ? evalPhotoList[idx] : null;
-      if (st) {
-        if (n === 0) {
-          st.textContent = 'Upload photos — ' + sessionTrials.length + ' trials logged';
-        } else if (p) {
-          st.textContent = sessionTrials.length + ' trials / ' + Object.keys(seenPhotoIds).length + ' photos';
-        } else {
-          st.textContent = Object.keys(seenPhotoIds).length + ' photos loaded — ' + sessionTrials.length + ' trials';
-        }
-      }
-    }
-
-    function exportAllTrials() {
-      if (sessionTrials.length === 0) { alert('No trials yet.'); return; }
-      var blob = new Blob([JSON.stringify({unique_photos: Object.keys(seenPhotoIds).length, total_trials: sessionTrials.length, trials: sessionTrials}, null, 2)], {type: 'application/json'});
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement('a');
-      a.href = url; a.download = 'eval-session-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
-      a.click(); URL.revokeObjectURL(url);
-    }
-
-    /* Events */
-    document.addEventListener('change', function(e) {
-      if (!evalOn) return;
-      if (!e.target || !e.target.classList.contains('eval-cb')) return;
-      updateEvalCardHighlight();
-      logTrial(e.target);
-    });
-    document.getElementById('eval-export-btn').addEventListener('click', exportAllTrials);
-    document.getElementById('eval-no-match-btn').addEventListener('click', logNoMatch);
-    document.getElementById('eval-prev-btn').addEventListener('click', prevPhoto);
-    document.getElementById('eval-next-btn').addEventListener('click', nextPhoto);
-
-    /* Watch body → re-show radios after results reload */
-    var bodyWatcher = new MutationObserver(function() {
-      if (!evalOn) return;
-      clearTimeout(bodyWatcher._tid);
-      bodyWatcher._tid = setTimeout(function() {
-        var grid = document.getElementById('results-grid');
-        if (!grid) return;
-        var labels = grid.querySelectorAll('.eval-radio-label');
-        if (labels.length > 0 && getComputedStyle(labels[0]).display === 'none') {
-          showEvalRadios();
-        }
-        updatePreviewAndStatus();
-      }, 150);
-    });
-    bodyWatcher.observe(document.body, { childList: true, subtree: true });
-
     self.disconnect();
   });
   obs.observe(document.body, { childList: true, subtree: true });
@@ -1041,10 +838,6 @@ def build_ui(index):
                     choices=TOP_K_OPTIONS, value=default_k,
                     label="Results", interactive=True,
                     elem_id="tb-dropdown",
-                )
-                eval_mode = gr.Checkbox(
-                    value=False, label="Eval", interactive=True,
-                    elem_id="tb-eval-toggle",
                 )
 
         # ── Hidden data pipe components ──
@@ -1100,8 +893,7 @@ def build_ui(index):
                     f'<span class="rank-num" style="color:{cc}">#{i+1}</span> '
                     f'<span style="color:{cc}">{sim:.3f}</span> {conf_label(sim)}'
                     f'<span class="fname">{html.escape(name)}</span>'
-                    f'</div><label class="eval-radio-label"><input type="radio" name="eval-correct" class="eval-cb" value="{html.escape(name)}">Correct</label>'
-                    f'</div>'
+                    f'</div></div>'
                 )
             return (
                 f'<div id="results-meta">{len(results)} results &middot; {elapsed_ms:.0f}ms</div>'
