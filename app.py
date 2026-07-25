@@ -14,7 +14,7 @@ def _settings_path():
     return os.path.join(os.path.expanduser("~"), ".fabric_matcher", "settings.json")
 
 def load_settings():
-    defaults = {"top_k": 15}
+    defaults = {"top_k": 15, "color_weight": 0.3, "poc_weight": 0.2}
     try:
         path = _settings_path()
         if os.path.exists(path):
@@ -63,11 +63,64 @@ def extract_embedding(pil_img, model, preprocess):
     return vec
 
 # ============================================================
+# Color Histogram (for hybrid CLIP + color search)
+# ============================================================
+def extract_color_histogram(pil_img, bins_h=8, bins_s=4, bins_v=2):
+    """HSV joint histogram. H is lighting-invariant; fewer V bins → robust to
+    exposure/shadow differences. PIL-native, no cv2 needed.
+    Returns 8×4×2 = 64-dim normalized vector."""
+    arr = np.array(pil_img.convert('HSV'), dtype=np.uint8)
+    step_h = 256 // bins_h
+    step_s = 256 // bins_s
+    step_v = 256 // bins_v
+    q_h = np.clip(arr[:, :, 0] // step_h, 0, bins_h - 1)
+    q_s = np.clip(arr[:, :, 1] // step_s, 0, bins_s - 1)
+    q_v = np.clip(arr[:, :, 2] // step_v, 0, bins_v - 1)
+    indices = (q_h * bins_s * bins_v +
+               q_s * bins_v +
+               q_v)
+    hist = np.bincount(indices.ravel(), minlength=bins_h * bins_s * bins_v).astype(np.float32)
+    return hist / hist.sum()
+
+
+def color_similarity(h1, h2):
+    """Histogram intersection — 1.0 = identical colors, 0.0 = no overlap."""
+    return float(np.sum(np.minimum(h1, h2)))
+
+
+def poc_score(pil1, pil2, size=128):
+    """Phase-Only Correlation — structural/pattern similarity, lighting-invariant.
+    Pure numpy FFT, no cv2 needed. Returns peak value (higher = more similar pattern).
+    Typical: 0.02-0.05 = different, 0.1-0.3 = same pattern."""
+    g1 = np.array(pil1.resize((size, size), Image.LANCZOS).convert('L'), dtype=np.float64)
+    g2 = np.array(pil2.resize((size, size), Image.LANCZOS).convert('L'), dtype=np.float64)
+
+    # Hann window to suppress edge artifacts
+    wy = np.hanning(size)
+    wx = np.hanning(size)
+    window = np.outer(wy, wx)
+    g1 = g1 * window
+    g2 = g2 * window
+
+    # FFT → cross-power spectrum → normalise magnitude
+    f1 = np.fft.fft2(g1)
+    f2 = np.fft.fft2(g2)
+    eps = 1e-8
+    r = (f1 * np.conj(f2)) / (np.abs(f1) * np.abs(f2) + eps)
+
+    # Inverse FFT → correlation plane
+    poc = np.fft.fftshift(np.fft.ifft2(r).real)
+    return float(np.max(poc))
+
+
+# ============================================================
 # FAISS Index
 # ============================================================
 class FabricIndex:
     def __init__(self):
         self.names = []; self.embeddings = None; self.index = None
+        self.color_histograms = None  # (N, bins³) per-image color fingerprints
+        self._name_to_idx = {}        # filename → array index
 
     @property
     def cache_dir(self):
@@ -80,29 +133,42 @@ class FabricIndex:
         cache_emb = os.path.join(self.cache_dir, "embeddings.npy")
         cache_names = os.path.join(self.cache_dir, "names.txt")
         cache_hash = os.path.join(self.cache_dir, "hash.txt")
+        cache_color = os.path.join(self.cache_dir, "color_histograms.npy")
         os.makedirs(self.cache_dir, exist_ok=True)
 
         files = sorted([f for f in os.listdir(fabric_dir)
                        if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
         h = hashlib.md5("".join(files).encode()).hexdigest()[:8]
 
+        # ── CLIP cache ──
         if not force and os.path.exists(cache_emb) and os.path.exists(cache_hash):
             with open(cache_hash) as f:
                 if f.read().strip() == h:
                     print(f"Loading cache ({len(files)} fabrics)...")
                     self.embeddings = np.load(cache_emb)
                     self.names = [ln.strip() for ln in open(cache_names) if ln.strip()]
-                    self._build_faiss()
-                    print(f"Ready: {len(self.names)} fabrics.")
-                    return self
+                    self._rebuild_maps()
+                    # Color cache may exist or need building
+                    if os.path.exists(cache_color):
+                        self.color_histograms = np.load(cache_color)
+                        self._build_faiss()
+                        print(f"Ready: {len(self.names)} fabrics (color cached).")
+                        return self
+                    else:
+                        print("Building color histograms (CLIP cache OK)...")
+                        self._build_color_histograms(files, cache_color)
+                        self._build_faiss()
+                        print(f"Ready: {len(self.names)} fabrics (colors cached).")
+                        return self
 
         model, preprocess = get_clip()
         print(f"Extracting embeddings ({len(files)} fabrics)...")
-        vectors = []
+        vectors = []; color_hists = []
         for i, f in enumerate(files):
             try:
                 pil = Image.open(os.path.join(fabric_dir, f)).convert("RGB")
                 vectors.append(extract_embedding(pil, model, preprocess))
+                color_hists.append(extract_color_histogram(pil))
                 self.names.append(f)
             except: pass
             finally:
@@ -113,12 +179,38 @@ class FabricIndex:
                 gc.collect()
 
         self.embeddings = np.array(vectors, dtype=np.float32)
+        self.color_histograms = np.array(color_hists, dtype=np.float32)
         np.save(cache_emb, self.embeddings)
+        np.save(cache_color, self.color_histograms)
         open(cache_names,"w").write("\n".join(self.names))
         open(cache_hash,"w").write(h)
+        self._rebuild_maps()
         self._build_faiss()
-        print(f"Ready: {len(self.names)} fabrics (cached).")
+        print(f"Ready: {len(self.names)} fabrics (all cached).")
         return self
+
+    def _rebuild_maps(self):
+        self._name_to_idx = {n: i for i, n in enumerate(self.names)}
+
+    def _build_color_histograms(self, files, cache_path):
+        """Compute color histograms for cached CLIP index (backfill)."""
+        n = len(self.names)
+        print(f"Building color histograms ({n} fabrics)...")
+        hists = []
+        for i, fname in enumerate(self.names):
+            try:
+                pil = Image.open(os.path.join(self._fabric_dir, fname)).convert("RGB")
+                hists.append(extract_color_histogram(pil))
+            except Exception:
+                hists.append(np.zeros(64, dtype=np.float32))
+            finally:
+                try: pil.close()
+                except: pass
+            if (i + 1) % 500 == 0:
+                print(f"  color {i + 1}/{n}")
+                gc.collect()
+        self.color_histograms = np.array(hists, dtype=np.float32)
+        np.save(cache_path, self.color_histograms)
 
     def _build_faiss(self):
         if len(self.embeddings) == 0:
@@ -141,10 +233,45 @@ class FabricIndex:
                 results.append((fname, float(s), pil))
         return results
 
+    def search_hybrid(self, pil_img, k=20, color_weight=0.3, poc_weight=0.2):
+        """CLIP + color histogram + POC structural verification.
+        color_weight=0 → pure CLIP, poc_weight=0 → no structural check."""
+        # ── Stage 1: CLIP fast retrieval ──
+        fetch_k = min(max(k * 3, k + 50), len(self.names))
+        clip_results = self.search(pil_img, fetch_k)
+
+        # ── Stage 2: color re-rank ──
+        if color_weight > 0.0 and self.color_histograms is not None:
+            query_hist = extract_color_histogram(pil_img)
+            scored = []
+            for fname, sim, pil in clip_results:
+                idx = self._name_to_idx.get(fname)
+                csim = color_similarity(query_hist, self.color_histograms[idx]) if idx is not None else 0.0
+                final = sim * (1.0 - color_weight) + csim * color_weight
+                scored.append((fname, final, pil))
+            scored.sort(key=lambda x: x[1], reverse=True)
+        else:
+            scored = clip_results
+
+        # ── Stage 3: POC structural check on final displayed results (fast, ~2ms/ea) ──
+        if poc_weight > 0.0:
+            display_n = min(k, len(scored))
+            for j in range(display_n):
+                fname, final, pil = scored[j]
+                if pil is not None:
+                    ps = poc_score(pil_img, pil)
+                    # POC peak ~0.02-0.05 for different, ~0.1-0.3 for same pattern
+                    # Normalise: clamp to [0, 0.25], scale to [0, 1]
+                    ps_norm = min(max(ps, 0.0), 0.25) / 0.25
+                    scored[j] = (fname, final + poc_weight * ps_norm, pil)
+            scored.sort(key=lambda x: x[1], reverse=True)
+
+        return scored[:k]
+
 # ============================================================
 # GUI Helpers
 # ============================================================
-TOP_K_OPTIONS = [5, 10, 15, 20, 30, 50]
+TOP_K_OPTIONS = [5, 10, 15, 20, 30, 50, 67, 85, 100]
 EMPTY_STATE = """<div class="empty-state"><div class="empty-icon">&#128247;</div><div>Upload a photo to find matching fabrics</div></div>"""
 
 def _logo_b64():
@@ -252,11 +379,13 @@ footer { display: none !important; }
   font-size: 10px; line-height: 16px; text-align: center; padding: 0;
 }
 
-/* ── Dropdown at row far right ── */
-#tb-dropdown { display: flex !important; align-items: center !important; gap: 8px !important; margin-left: auto !important; }
-#tb-dropdown label { margin: 0 !important; font-size: 13px !important; white-space: nowrap !important; }
-#tb-dropdown .wrap { flex: none !important; }
+/* Controls at row far right */
+#tb-dropdown { display: flex !important; align-items: center !important; gap: 6px !important; }
+#tb-color-slider { display: flex !important; align-items: center !important; gap: 6px !important; }
+#tb-dropdown label, #tb-color-slider label { margin: 0 !important; font-size: 12px !important; white-space: nowrap !important; color: #888 !important; font-weight: 400 !important; }
+#tb-dropdown .wrap, #tb-color-slider .wrap { flex: none !important; }
 #tb-dropdown select, #tb-dropdown input { font-size: 13px !important; }
+#tb-color-slider input[type="range"] { accent-color: #4caf50; width: 80px; }
 
 /* ── Results ── */
 #results-wrap { padding: 14px 18px; min-height: calc(100vh - 80px); }
@@ -298,7 +427,7 @@ footer { display: none !important; }
 /* ── Comparison lightbox ── */
 #img-modal {
   display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-  background: rgba(0,0,0,0.92); z-index: 10000; cursor: pointer;
+  background: rgba(0,0,0,0.92); z-index: 10000; cursor: default;
 }
 #img-modal.active { display: flex; align-items: center; justify-content: center; }
 #img-modal .compare-wrap {
@@ -310,16 +439,41 @@ footer { display: none !important; }
   max-width: 44vw; max-height: 85vh;
 }
 #img-modal .compare-side img {
-  max-width: 100%; max-height: 65vh; object-fit: contain; cursor: default;
+  display: block;
   box-shadow: 0 4px 24px rgba(0,0,0,0.6); border-radius: 6px; background: #222;
 }
+#img-modal .compare-side .img-container {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; max-height: 65vh; overflow: hidden;
+  border-radius: 6px; background: #222; position: relative;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.6);
+}
+#img-modal .compare-side .img-container img {
+  max-width: 100%; max-height: 65vh; object-fit: contain; cursor: grab;
+  box-shadow: none; border-radius: 0; background: transparent;
+  transform-origin: 0 0; transition: none;
+}
+#img-modal .compare-side .img-container img.grabbing { cursor: grabbing; }
+#img-modal .compare-side .zoom-bar {
+  display: flex; align-items: center; gap: 6px; margin-top: 8px;
+  color: #aaa; font-size: 12px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  user-select: none;
+}
+#img-modal .compare-side .zoom-bar button {
+  background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.2);
+  color: #ccc; border-radius: 4px; cursor: pointer; font-size: 14px;
+  width: 26px; height: 26px; line-height: 1; padding: 0; transition: background 0.15s;
+}
+#img-modal .compare-side .zoom-bar button:hover { background: rgba(255,255,255,0.25); color: #fff; }
+#img-modal .compare-side .zoom-bar .zoom-pct { min-width: 36px; text-align: center; }
 #img-modal .compare-label {
   color: #aaa; font-size: 12px; margin-bottom: 6px;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 #img-modal .modal-close {
   position: absolute; top: 16px; right: 28px; color: #fff;
-  font-size: 36px; cursor: pointer; line-height: 1; user-select: none;
+  font-size: 36px; cursor: pointer; line-height: 1; user-select: none; z-index: 10001;
 }
 #img-modal .modal-close:hover { opacity: 0.6; }
 
@@ -373,18 +527,134 @@ APP_JS = r"""
   lb.id = 'img-modal';
   lb.innerHTML = '<span class="modal-close">&times;</span>' +
     '<div class="compare-wrap">' +
-    '<div class="compare-side"><div class="compare-label">Your Photo</div><img id="modal-img-left" src=""></div>' +
-    '<div class="compare-side"><div class="compare-label">Fabric Match</div><img id="modal-img-right" src=""></div>' +
+    '<div class="compare-side">' +
+      '<div class="compare-label">Your Photo</div>' +
+      '<div class="img-container" id="lb-container-left"><img id="modal-img-left" src=""></div>' +
+      '<div class="zoom-bar">' +
+        '<button id="zoom-out-left" title="Zoom out">−</button>' +
+        '<span class="zoom-pct" id="zoom-pct-left">100%</span>' +
+        '<button id="zoom-in-left" title="Zoom in">+</button>' +
+        '<button id="zoom-reset-left" title="Reset">1:1</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="compare-side">' +
+      '<div class="compare-label">Fabric Match</div>' +
+      '<div class="img-container" id="lb-container-right"><img id="modal-img-right" src=""></div>' +
+      '<div class="zoom-bar">' +
+        '<button id="zoom-out-right" title="Zoom out">−</button>' +
+        '<span class="zoom-pct" id="zoom-pct-right">100%</span>' +
+        '<button id="zoom-in-right" title="Zoom in">+</button>' +
+        '<button id="zoom-reset-right" title="Reset">1:1</button>' +
+      '</div>' +
+    '</div>' +
     '</div>';
   document.body.appendChild(lb);
-  var lbLeft = document.getElementById('modal-img-left');
+  var lbLeft  = document.getElementById('modal-img-left');
   var lbRight = document.getElementById('modal-img-right');
+  var lbCntL  = document.getElementById('lb-container-left');
+  var lbCntR  = document.getElementById('lb-container-right');
+
+  /* ── Zoom state per side ── */
+  var zoom = {
+    left:  { s: 1, px: 0, py: 0, dragging: false, sx: 0, sy: 0 },
+    right: { s: 1, px: 0, py: 0, dragging: false, sx: 0, sy: 0 }
+  };
+
+  function clampZoom(v) { return Math.min(Math.max(v, 0.5), 5.0); }
+
+  function applyZoom(side, imgEl, container) {
+    var z = zoom[side];
+    imgEl.style.transform = 'translate(' + z.px + 'px, ' + z.py + 'px) scale(' + z.s + ')';
+    var pct = Math.round(z.s * 100);
+    var pctEl = document.getElementById('zoom-pct-' + side);
+    if (pctEl) pctEl.textContent = pct + '%';
+  }
+
+  function resetZoom(side, imgEl) {
+    zoom[side].s = 1; zoom[side].px = 0; zoom[side].py = 0;
+    applyZoom(side, imgEl);
+  }
+
+  /* ── Wheel → zoom ── */
+  function onWheel(e, side, imgEl, container) {
+    e.preventDefault();
+    var z = zoom[side];
+    // Zoom toward cursor position
+    var rect = container.getBoundingClientRect();
+    var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    var fs = clampZoom(z.s * (e.deltaY < 0 ? 1.12 : 0.89));
+    var ratio = fs / z.s;
+    z.px = mx - ratio * (mx - z.px);
+    z.py = my - ratio * (my - z.py);
+    z.s = fs;
+    if (fs <= 1.01) { z.s = 1; z.px = 0; z.py = 0; }
+    applyZoom(side, imgEl);
+  }
+
+  /* ── Drag → pan (only when zoomed) ── */
+  function onMouseDown(e, side, imgEl) {
+    if (zoom[side].s <= 1.01) return;
+    e.preventDefault();
+    zoom[side].dragging = true;
+    zoom[side].sx = e.clientX - zoom[side].px;
+    zoom[side].sy = e.clientY - zoom[side].py;
+    imgEl.classList.add('grabbing');
+  }
+
+  function onMouseMove(e, side, imgEl) {
+    var z = zoom[side];
+    if (!z.dragging) return;
+    z.px = e.clientX - z.sx;
+    z.py = e.clientY - z.sy;
+    applyZoom(side, imgEl);
+  }
+
+  function onMouseUp(side, imgEl) {
+    zoom[side].dragging = false;
+    imgEl.classList.remove('grabbing');
+  }
+
+  /* Wire left image: wheel + drag */
+  lbLeft.addEventListener('wheel', function(e) { onWheel(e, 'left', lbLeft, lbCntL); });
+  lbLeft.addEventListener('mousedown', function(e) { onMouseDown(e, 'left', lbLeft); });
+  document.addEventListener('mousemove', function(e) { onMouseMove(e, 'left', lbLeft); });
+  document.addEventListener('mouseup',   function()  { onMouseUp('left', lbLeft); });
+
+  /* Wire right image: wheel + drag (independent zoom) */
+  lbRight.addEventListener('wheel', function(e) { onWheel(e, 'right', lbRight, lbCntR); });
+  lbRight.addEventListener('mousedown', function(e) { onMouseDown(e, 'right', lbRight); });
+  document.addEventListener('mousemove', function(e) { onMouseMove(e, 'right', lbRight); });
+  document.addEventListener('mouseup',   function()  { onMouseUp('right', lbRight); });
+
+  /* Zoom bar buttons */
+  function zoomBtn(side, imgEl, delta) {
+    var z = zoom[side];
+    var fs = clampZoom(z.s * delta);
+    if (fs <= 1.01) { z.s = 1; z.px = 0; z.py = 0; }
+    else { z.s = fs; }
+    applyZoom(side, imgEl);
+  }
+  document.getElementById('zoom-in-left').addEventListener('click', function() { zoomBtn('left', lbLeft, 1.25); });
+  document.getElementById('zoom-out-left').addEventListener('click', function() { zoomBtn('left', lbLeft, 0.8); });
+  document.getElementById('zoom-reset-left').addEventListener('click', function() { resetZoom('left', lbLeft); });
+  document.getElementById('zoom-in-right').addEventListener('click', function() { zoomBtn('right', lbRight, 1.25); });
+  document.getElementById('zoom-out-right').addEventListener('click', function() { zoomBtn('right', lbRight, 0.8); });
+  document.getElementById('zoom-reset-right').addEventListener('click', function() { resetZoom('right', lbRight); });
+
+  /* Close lightbox → reset zooms */
+  var origActivate = function() { zoom.left = { s:1, px:0, py:0, dragging:false, sx:0, sy:0 }; zoom.right = { s:1, px:0, py:0, dragging:false, sx:0, sy:0 }; applyZoom('left', lbLeft); applyZoom('right', lbRight); };
   lb.addEventListener('click', function(e) {
-    if (e.target === lb || e.target.classList.contains('modal-close'))
+    if (e.target === lb || e.target.classList.contains('modal-close')) {
       lb.classList.remove('active');
+      origActivate();
+    }
   });
   document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape') { lb.classList.remove('active'); closeCrop(); }
+    if (e.key === 'Escape') {
+      lb.classList.remove('active');
+      origActivate();
+      closeCrop();
+    }
   });
 
   /* ── Crop modal ── */
@@ -423,9 +693,7 @@ APP_JS = r"""
     function overlay(rx, ry, rw, rh) {
       var ctx = c.getContext('2d');
       ctx.clearRect(0, 0, crop.dw, crop.dh);
-      ctx.fillStyle = 'rgba(0,0,0,0.25)';
-      ctx.fillRect(0, 0, crop.dw, crop.dh);
-      ctx.drawImage(crop.img, rx, ry, rw, rh, rx, ry, rw, rh);
+      ctx.drawImage(crop.img, 0, 0, crop.dw, crop.dh);
       ctx.strokeStyle = '#4caf50'; ctx.lineWidth = 2;
       ctx.setLineDash([5, 3]); ctx.strokeRect(rx, ry, rw, rh);
       ctx.setLineDash([]);
@@ -592,6 +860,8 @@ APP_JS = r"""
         var ts = document.getElementById('thumb-img');
         if (lbLeft && ts && ts.src) lbLeft.src = ts.src;
         if (lbRight) lbRight.src = img.src;
+        resetZoom('left', lbLeft);
+        resetZoom('right', lbRight);
         lb.classList.add('active');
       }
     });
@@ -634,6 +904,8 @@ def build_ui(index):
     logo_b64_str = _logo_b64()
     settings = load_settings()
     default_k = settings.get("top_k", 15)
+    default_color_w = settings.get("color_weight", 0.3)
+    default_poc_w = settings.get("poc_weight", 0.2)
 
     top_bar_html = make_top_bar_html(n_fabrics, logo_b64_str)
 
@@ -643,14 +915,20 @@ def build_ui(index):
         theme=gr.themes.Monochrome(),
         title="Fabric Pattern Matcher"
     ) as app:
-        # ── Top bar: logo + upload area (HTML) | Results dropdown (Gradio, rightmost) ──
+        # ── Top bar: logo + upload (HTML) | Color slider + Results (right group) ──
         with gr.Row(elem_id="top-bar-row", equal_height=True):
             gr.HTML(top_bar_html, elem_id="tb-html-area")
-            top_k = gr.Dropdown(
-                choices=TOP_K_OPTIONS, value=default_k,
-                label="Results", interactive=True,
-                elem_id="tb-dropdown", scale=0,
-            )
+            with gr.Column(elem_id="tb-controls-wrap", scale=0):
+                top_k = gr.Dropdown(
+                    choices=TOP_K_OPTIONS, value=default_k,
+                    label="Results", interactive=True,
+                    elem_id="tb-dropdown",
+                )
+                color_weight = gr.Slider(
+                    minimum=0.0, maximum=1.0, value=default_color_w,
+                    step=0.05, label="Color", interactive=True,
+                    elem_id="tb-color-slider",
+                )
 
         # ── Hidden data pipe components ──
         input_img = gr.Image(
@@ -670,7 +948,7 @@ def build_ui(index):
                 return "", EMPTY_STATE
             return "data:image/jpeg;base64," + pil_to_b64(pil_img, quality=90)
 
-        def on_search(b64_val, k_val):
+        def on_search(b64_val, k_val, color_w):
             if not b64_val or not b64_val.strip():
                 return EMPTY_STATE
             try:
@@ -684,8 +962,9 @@ def build_ui(index):
                 s = max(224.0 / w, 224.0 / h)
                 img = img.resize((int(w * s), int(h * s)), Image.LANCZOS)
             t0 = time.time()
+            poc_w = float(default_poc_w)
             try:
-                results = index.search(img, int(k_val))
+                results = index.search_hybrid(img, int(k_val), float(color_w), poc_w)
             except Exception:
                 return """<div class="empty-state"><div style="color:#d32f2f">Search error</div></div>"""
             elapsed_ms = (time.time() - t0) * 1000
@@ -715,6 +994,9 @@ def build_ui(index):
         def on_top_k_change(k_val):
             save_settings({"top_k": int(k_val)})
 
+        def on_color_weight_change(cw_val):
+            save_settings({"color_weight": float(cw_val)})
+
         # ── Event wiring ──────────────────────────────────────
         # All uploads (click/drag/paste) write dataURL directly to crop_b64
         # via JS FileReader → setTextareaValue(). Gradio change event triggers search.
@@ -722,7 +1004,7 @@ def build_ui(index):
         # Textbox value change → search (the ONLY path to search)
         crop_b64.change(
             on_search,
-            inputs=[crop_b64, top_k],
+            inputs=[crop_b64, top_k, color_weight],
             outputs=[results_html]
         )
 
@@ -732,7 +1014,17 @@ def build_ui(index):
             inputs=[top_k], outputs=None
         ).then(
             on_search,
-            inputs=[crop_b64, top_k],
+            inputs=[crop_b64, top_k, color_weight],
+            outputs=[results_html]
+        )
+
+        # Color weight change → save + re-search (no re-upload needed)
+        color_weight.change(
+            on_color_weight_change,
+            inputs=[color_weight], outputs=None
+        ).then(
+            on_search,
+            inputs=[crop_b64, top_k, color_weight],
             outputs=[results_html]
         )
 
@@ -749,6 +1041,7 @@ if __name__ == "__main__":
     p.add_argument("--share", action="store_true")
     args = p.parse_args()
 
+    import socket
     print("=" * 50)
     print(" Fabric Pattern Matcher")
     print("=" * 50)
@@ -759,4 +1052,18 @@ if __name__ == "__main__":
     index = FabricIndex()
     index.build(args.fabric_dir)
     app = build_ui(index)
-    app.launch(server_port=args.port, share=args.share, inbrowser=True)
+
+    # Print LAN access URLs
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        local_ip = "127.0.0.1"
+    print("=" * 50)
+    print(f"  Local:   http://127.0.0.1:{args.port}")
+    print(f"  Network: http://{local_ip}:{args.port}")
+    print("=" * 50)
+
+    app.launch(server_name="0.0.0.0", server_port=args.port, share=args.share, inbrowser=True)

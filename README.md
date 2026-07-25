@@ -5,14 +5,16 @@
 ## 技术架构
 
 ```
-照片上传 → CLIP ViT-B/32 提取嵌入 → FAISS 向量检索 → 排序输出
+照片上传 → CLIP ViT-B/32 提取嵌入 → HSV颜色直方图融合 → FAISS 向量检索 → POC 结构验证 → 排序输出
 ```
 
 - **CLIP** (OpenAI) — 预训练视觉模型，提取 512 维语义嵌入，光照/角度/尺度不变
+- **HSV 颜色直方图** — 8×4×2=64 维，H 分量光照不变，与 CLIP 加权融合解决色差不匹配
+- **POC 相位相关** (Phase-Only Correlation) — 纯 numpy FFT，对最终结果做结构/纹理重合度验证，花型匹配的关键信号
 - **FAISS** (Meta) — 向量索引，毫秒级检索，支持 10 万+ 花型库
 - **Gradio** — Web UI，拖拽上传即用
 
-每次检索耗时 ~50ms（不含模型首次加载）。
+每次检索耗时 ~50ms（不含模型首次加载），POC 结构验证 +~30ms。
 
 ## 快速开始
 
@@ -28,31 +30,21 @@ python app.py --fabric-dir dir/fabric
 
 首次运行会下载 CLIP 模型（~300MB），之后使用本地缓存。
 
-## 目录结构
-
-```
-fabric/
-├── app.py                  # Gradio GUI + CLIP + FAISS 检索主程序
-├── dir/
-│   ├── fabric/             # 花型库（PNG/JPG，任意数量）
-│   └── photo/              # 测试照片（10 张，供评估用）
-├── matcher_v3/             # 传统 CV 方案（v1-v5 迭代记录）
-│   ├── features.py         # 手工特征提取（LBP/Gabor/FFT/GLCM/形状）
-│   ├── acorr_fingerprint.py # 自相关结构指纹
-│   ├── matcher.py          # 多策略匹配器
-│   └── clip_matcher.py     # ResNet50 方案（备选）
-├── analyze_fabric.py       # v1 分析脚本
-├── eval_clip.py            # CLIP 评估脚本
-└── .fabric_cache/          # 嵌入缓存（自动生成）
-```
-
 ## GUI 功能
 
-- 拖拽/点击上传照片
+- 拖拽/点击/粘贴上传照片
+- **裁剪工具** — 框选面料区域，去除背景干扰
+- **Color 滑块** — 调节颜色匹配权重（0=纯CLIP，1=纯颜色），拖拽即重新搜索
+- **结果数量可选** 5~100 条
 - 置信度分级显示（极高/高/中/较低/低）
-- 相似度进度条
-- 清空/重新检索
-- 返回数量可调
+- **比对灯箱** — 点击结果图弹出两栏对比，左侧支持滚轮缩放 + 拖拽平移比对细节
+- 设置持久化至 `~/.fabric_matcher/settings.json`
+
+## 缓存
+
+- CLIP 嵌入：`.fabric_cache/embeddings.npy`（~11 MB / 5000 张）
+- 颜色直方图：`.fabric_cache/color_histograms.npy`（~1.5 MB / 5000 张）
+- 文件变更（增删花型图）自动失效重建
 
 ## 评估结果（490 花型库, 10 测试照片）
 
@@ -73,6 +65,7 @@ fabric/
 4. **v4**: + Gabor/GLCM/自相关形状特征 → 40% (24 花型)
 5. **v5**: + Z-score/Borda 融合/模板匹配/POC → 50% Top-100 (490 花型)
 6. **CLIP+FAISS**: 深度学习方案 → 80% Top-100 (490 花型)
+7. **CLIP+HSV+POC**: 混合检索 + 颜色融合 + 结构验证 → 当前方案
 
 ## License
 
